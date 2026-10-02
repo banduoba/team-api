@@ -1096,7 +1096,7 @@ const { exporting, exportFile } = useExport({
 										<div v-if="(tc.tokens || 0) > 0" class="snapshot-row">
 											<span class="snapshot-label">{{ tokenCostLabels[key] || key }}</span>
 											<span class="snapshot-value">
-												{{ (tc.tokens || 0).toLocaleString() }} tokens &times; {{ formatBilling(tc.unit_price || 0, 6) }}/1M = <strong>{{ formatBilling(tc.cost || 0, 6) }}</strong>
+												{{ (tc.tokens || 0).toLocaleString() }} tokens &times; {{ formatBilling(tc.unit_price || 0, 6) }}/1M<span v-if="tc.multiplier && tc.multiplier !== 1">&nbsp;&times;&nbsp;{{ tc.multiplier }}</span> = <strong>{{ formatBilling(tc.cost || 0, 6) }}</strong>
 											</span>
 										</div>
 									</template>

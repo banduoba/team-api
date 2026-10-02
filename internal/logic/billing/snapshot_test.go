@@ -171,6 +171,8 @@ func TestBuildTokenCosts(t *testing.T) {
 		OutputPrice:        1.5,
 		CacheReadPrice:     0.1,
 		CacheCreationPrice: 0.3,
+		TenantMultiplier:   0.85,
+		TimeMultiplier:     1.0,
 	}
 	breakdown := &CostBreakdown{
 		InputTokens:         2000,
@@ -208,6 +210,21 @@ func TestBuildTokenCosts(t *testing.T) {
 	if costs["cache_creation"].Tokens != 300 {
 		t.Errorf("cache_creation tokens = %d, want 300", costs["cache_creation"].Tokens)
 	}
+
+	// 综合倍率随行写入：tokens/1M × unit_price × multiplier = cost 可自洽复算
+	assertFloat(t, costs["input"].Multiplier, 0.85, "input multiplier")
+	assertFloat(t, costs["cache_read"].Multiplier, 0.85, "cache_read multiplier")
+
+	// 租户 × 时段连乘：decimal 计算，无 float 尾差（0.85 × 0.6 = 0.51 而非 0.509999...）
+	pricing.TimeMultiplier = 0.6
+	costs = buildTokenCosts(pricing, breakdown)
+	assertFloat(t, costs["input"].Multiplier, 0.51, "combined multiplier")
+
+	// 无折扣时倍率恰为 1（JSON omitempty 省略，摘要不带倍率段）
+	pricing.TenantMultiplier = 1.0
+	pricing.TimeMultiplier = 1.0
+	costs = buildTokenCosts(pricing, breakdown)
+	assertFloat(t, costs["input"].Multiplier, 1.0, "no-discount multiplier")
 }
 
 func TestBuildTokenCosts_NoCache(t *testing.T) {
@@ -362,9 +379,9 @@ func TestGenerateBillingSummary_SchemeAndPerSecond(t *testing.T) {
 func TestGenerateBillingSummary_PerRequest(t *testing.T) {
 	snapshot := &BillingSnapshot{
 		Pricing: BillingSnapshotPricing{
-			BillingMode:         "per_request",
-			EffectiveInputPrice: 0.50,
-			BillingSource:       "base",
+			BillingMode:     "per_request",
+			PerRequestPrice: 0.50,
+			BillingSource:   "base",
 		},
 		Multipliers: BillingSnapshotMultipliers{
 			TenantMultiplier: 1.0,
@@ -385,8 +402,8 @@ func TestGenerateBillingSummary_PerRequest(t *testing.T) {
 	if !strings.Contains(text, "dall-e-3") {
 		t.Error("summary should contain model name")
 	}
-	if !strings.Contains(text, "0.50") {
-		t.Error("summary should contain price")
+	if !strings.Contains(text, "按次单价: $0.500000") {
+		t.Errorf("summary should contain per-request price, got:\n%s", text)
 	}
 }
 
@@ -575,7 +592,95 @@ func TestGenerateBillingSummary_TimeRule(t *testing.T) {
 	if !strings.Contains(text, "闲时") {
 		t.Errorf("summary should contain time rule name, got:\n%s", text)
 	}
-	if !strings.Contains(text, "时段乘数(0.50)") {
-		t.Errorf("summary should contain time multiplier in subtotal line, got:\n%s", text)
+	if !strings.Contains(text, "时段乘数(0.5)") {
+		t.Errorf("summary should contain time multiplier in applied-multiplier line, got:\n%s", text)
+	}
+	if !strings.Contains(text, "已应用倍率: 租户倍率(0.8) × 时段乘数(0.5)") {
+		t.Errorf("summary should contain applied multiplier line, got:\n%s", text)
+	}
+}
+
+// TestSummaryEquationConsistency 端到端验证计费摘要的算式一致性：
+// computeCost → 快照 → 摘要全链路后，每行展示的乘法算式两边必须相等。
+// 背景：分项费用（InputCost/OutputCost）已含折扣，旧格式把折后分项摆进
+// 「tokens × 原价 = 费用」和「(分项之和) × 倍率 = 实际」两个模板，
+// 算式与结果对不上（折上折观感）；新格式把倍率显式拉进算式。
+func TestSummaryEquationConsistency(t *testing.T) {
+	// 平台价 in=$3/1M out=$4/1M，租户倍率 0.9 × 时段乘数 1.2，用量 1M in / 0.5M out
+	pricing := &PricingResult{
+		InputPrice:       3.0,
+		OutputPrice:      4.0,
+		BaseInputPrice:   3.0,
+		BaseOutputPrice:  4.0,
+		BillingMode:      "token",
+		BillingSource:    "base",
+		TenantMultiplier: 0.9,
+		TimeMultiplier:   1.2,
+		Currency:         "USD",
+	}
+	usage := &rcommon.Usage{PromptTokens: 1_000_000, CompletionTokens: 500_000}
+	bd := computeCost(pricing, usage.PromptTokens, usage.CompletionTokens, usage)
+
+	snap := GenerateBillingSnapshot(pricing, bd, usage, &SettlementResult{
+		PreDeductAmount: 6.0,
+		ActualCost:      bd.TotalCost,
+	}, nil)
+	text := GenerateBillingSummary(context.Background(), snap)
+
+	// 1. 明细行算式成立：tokens × 原价 × 综合倍率 = 分项费用（0.9 × 1.2 = 1.08）
+	if !strings.Contains(text, "输入: 1000000 tokens × $3.000000/1M × 1.08 = $3.240000") {
+		t.Errorf("input line equation broken, got:\n%s", text)
+	}
+	if !strings.Contains(text, "输出: 500000 tokens × $4.000000/1M × 1.08 = $2.160000") {
+		t.Errorf("output line equation broken, got:\n%s", text)
+	}
+
+	// 2. 合计行替换旧小计行：分项之和 = 实际费用（不再对折后费用二次乘倍率）
+	if !strings.Contains(text, "合计: ($3.240000 + $2.160000) = $5.400000") {
+		t.Errorf("total line equation broken, got:\n%s", text)
+	}
+	if strings.Contains(text, "小计") {
+		t.Errorf("legacy subtotal line (post-discount costs × multiplier) should be gone, got:\n%s", text)
+	}
+
+	// 3. 倍率说明行独立展示
+	if !strings.Contains(text, "已应用倍率: 租户倍率(0.9) × 时段乘数(1.2)") {
+		t.Errorf("applied multiplier line missing, got:\n%s", text)
+	}
+
+	// 4. 快照自洽复算：tokens/1M × unit_price × multiplier == cost（6 位展示精度内）
+	for key, tc := range snap.TokenCosts {
+		if tc.Tokens <= 0 {
+			continue
+		}
+		want := float64(tc.Tokens) / 1_000_000 * tc.UnitPrice * tc.Multiplier
+		if diff := want - tc.Cost; diff > 0.000001 || diff < -0.000001 {
+			t.Errorf("token_costs[%s] 不自洽: %d × %.6f × %s != %.6f",
+				key, tc.Tokens, tc.UnitPrice, formatMultiplier(tc.Multiplier), tc.Cost)
+		}
+	}
+}
+
+// TestSummaryNoDiscountPlain 无折扣时摘要不出现倍率段与倍率说明行（保持原有简洁格式）
+func TestSummaryNoDiscountPlain(t *testing.T) {
+	pricing := &PricingResult{
+		InputPrice:       3.0,
+		OutputPrice:      4.0,
+		BillingMode:      "token",
+		BillingSource:    "base",
+		TenantMultiplier: 1.0,
+		TimeMultiplier:   1.0,
+		Currency:         "USD",
+	}
+	usage := &rcommon.Usage{PromptTokens: 1_000_000, CompletionTokens: 500_000}
+	bd := computeCost(pricing, usage.PromptTokens, usage.CompletionTokens, usage)
+	snap := GenerateBillingSnapshot(pricing, bd, usage, &SettlementResult{ActualCost: bd.TotalCost}, nil)
+	text := GenerateBillingSummary(context.Background(), snap)
+
+	if !strings.Contains(text, "输入: 1000000 tokens × $3.000000/1M = $3.000000") {
+		t.Errorf("no-discount input line should have no multiplier segment, got:\n%s", text)
+	}
+	if strings.Contains(text, "已应用倍率") {
+		t.Errorf("no-discount summary should not contain applied multiplier line, got:\n%s", text)
 	}
 }

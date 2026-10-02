@@ -32,6 +32,9 @@ type BillingSnapshotPricing struct {
 	// PerSecondPrices 按秒单价矩阵（仅 per_second / special 模式填充，其余模式 omitted）：
 	// special 的矩阵是输出生成组件的定价依据，快照携带供账单解释
 	PerSecondPrices map[string]float64 `json:"per_second_prices,omitempty"`
+	// PerRequestPrice 按次单价（仅 per_request 模式填充）：摘要的「按次单价」行取此值。
+	// 此前误用 EffectiveInputPrice（token 输入价，纯按次模型恒为 0，展示「按次单价: $0」）
+	PerRequestPrice float64 `json:"per_request_price,omitempty"`
 }
 
 // BillingSnapshotMultipliers 倍率信息
@@ -54,7 +57,13 @@ type BillingSnapshotCachePrices struct {
 type TokenCostDetail struct {
 	Tokens    int     `json:"tokens"`
 	UnitPrice float64 `json:"unit_price"`
-	Cost      float64 `json:"cost"`
+	// Multiplier 该分项已乘的综合倍率（租户倍率 × 时段乘数）。
+	// Cost 是已乘倍率的实际费用而 UnitPrice 是未乘倍率的原价，二者口径不同：
+	// 缺少该字段时「tokens/1M × unit_price = cost」表面不成立（折上折观感），
+	// 写入后完整算式 tokens/1M × unit_price × multiplier = cost 可自洽复算。
+	// 恰为 1（无折扣）时 omitempty 省略；旧快照无此字段，读取方按 1 处理。
+	Multiplier float64 `json:"multiplier,omitempty"`
+	Cost       float64 `json:"cost"`
 }
 
 // BillingSnapshotSettlement 结算信息
@@ -96,6 +105,7 @@ func GenerateBillingSnapshot(
 			BillingSource:        pricing.BillingSource,
 			Scheme:               pricing.Scheme,
 			PerSecondPrices:      pricing.PerSecondPrices,
+			PerRequestPrice:      pricing.PerRequestPrice,
 		},
 		Multipliers: BillingSnapshotMultipliers{
 			ModelMultiplier:  pricing.ModelMultiplier,
@@ -145,37 +155,31 @@ func GenerateBillingSnapshot(
 	return snapshot
 }
 
-// buildTokenCosts 构建各类 token 的费用明细
+// buildTokenCosts 构建各类 token 的费用明细。
+// Cost 分项为已乘综合倍率的实际费用（与 computeCost 的 InputCost/OutputCost 口径一致），
+// Multiplier 随行写入使「tokens/1M × unit_price × multiplier = cost」可自洽复算。
 func buildTokenCosts(pricing *PricingResult, breakdown *CostBreakdown) map[string]TokenCostDetail {
-	costs := make(map[string]TokenCostDetail)
+	// decimal 相乘后回转 float64：避免 0.85×1.2 在 IEEE double 下产生
+	// 1.0199999999999998 类尾差进入快照与展示算式
+	mul := InexactFloat64(NewFromFloat(pricing.TenantMultiplier).Mul(NewFromFloat(effectiveTimeMultiplier(pricing))))
 
-	costs["input"] = TokenCostDetail{
-		Tokens:    breakdown.InputTokens,
-		UnitPrice: pricing.InputPrice,
-		Cost:      breakdown.InputCost,
+	detail := func(tokens int, unitPrice, cost float64) TokenCostDetail {
+		return TokenCostDetail{Tokens: tokens, UnitPrice: unitPrice, Multiplier: mul, Cost: cost}
 	}
-	costs["output"] = TokenCostDetail{
-		Tokens:    breakdown.OutputTokens,
-		UnitPrice: pricing.OutputPrice,
-		Cost:      breakdown.OutputCost,
+
+	costs := map[string]TokenCostDetail{
+		"input":  detail(breakdown.InputTokens, pricing.InputPrice, breakdown.InputCost),
+		"output": detail(breakdown.OutputTokens, pricing.OutputPrice, breakdown.OutputCost),
 	}
 
 	if breakdown.CacheReadTokens > 0 {
 		// direct cache price
-		costs["cache_read"] = TokenCostDetail{
-			Tokens:    breakdown.CacheReadTokens,
-			UnitPrice: pricing.CacheReadPrice,
-			Cost:      breakdown.CacheReadCost,
-		}
+		costs["cache_read"] = detail(breakdown.CacheReadTokens, pricing.CacheReadPrice, breakdown.CacheReadCost)
 	}
 
 	if breakdown.CacheCreationTokens > 0 {
 		// direct cache creation price
-		costs["cache_creation"] = TokenCostDetail{
-			Tokens:    breakdown.CacheCreationTokens,
-			UnitPrice: pricing.CacheCreationPrice,
-			Cost:      breakdown.CacheCreationCost,
-		}
+		costs["cache_creation"] = detail(breakdown.CacheCreationTokens, pricing.CacheCreationPrice, breakdown.CacheCreationCost)
 	}
 
 	return costs
@@ -233,68 +237,57 @@ func GenerateBillingSummary(ctx context.Context, snapshot *BillingSnapshot) stri
 
 	// 按次计费特殊处理
 	if snapshot.Pricing.BillingMode == "per_request" {
-		lines = append(lines, fmt.Sprintf("按次单价: %s%.6f", sym, snapshot.Pricing.EffectiveInputPrice))
+		// 按次单价取 PerRequestPrice（此前误用 EffectiveInputPrice = token 输入价，
+		// 纯按次模型恒为 0，摘要展示「按次单价: $0.000000」）
+		lines = append(lines, fmt.Sprintf("按次单价: %s", money(snapshot.Pricing.PerRequestPrice)))
 	} else {
-		// 各类 token 费用明细
-		if tc, ok := snapshot.TokenCosts["input"]; ok && tc.Tokens > 0 {
-			lines = append(lines, fmt.Sprintf("输入: %s tokens × %s/1M = %s",
-				formatInt(tc.Tokens), money(tc.UnitPrice), money(tc.Cost)))
+		// 各类 token 费用明细：tokens × 原价/1M × 倍率 = 实际费用。
+		// Cost 分项已含折扣（computeCost 分项 × mul），倍率必须显式进入算式，
+		// 否则「原价单价 = 折后费用」表面不成立；无折扣时省略倍率段
+		tokenRows := []struct {
+			label string
+			key   string
+		}{
+			{"输入", "input"},
+			{"输出", "output"},
+			{"缓存读取", "cache_read"},
+			{"缓存创建", "cache_creation"},
 		}
-		if tc, ok := snapshot.TokenCosts["output"]; ok && tc.Tokens > 0 {
-			lines = append(lines, fmt.Sprintf("输出: %s tokens × %s/1M = %s",
-				formatInt(tc.Tokens), money(tc.UnitPrice), money(tc.Cost)))
-		}
-		if tc, ok := snapshot.TokenCosts["cache_read"]; ok && tc.Tokens > 0 {
-			lines = append(lines, fmt.Sprintf("缓存读取: %s tokens × %s/1M = %s",
-				formatInt(tc.Tokens), money(tc.UnitPrice), money(tc.Cost)))
-		}
-		if tc, ok := snapshot.TokenCosts["cache_creation"]; ok && tc.Tokens > 0 {
-			lines = append(lines, fmt.Sprintf("缓存创建: %s tokens × %s/1M = %s",
-				formatInt(tc.Tokens), money(tc.UnitPrice), money(tc.Cost)))
+		var costParts []string
+		for _, row := range tokenRows {
+			tc, ok := snapshot.TokenCosts[row.key]
+			if !ok || tc.Tokens <= 0 {
+				continue
+			}
+			multPart := ""
+			if tc.Multiplier > 0 && tc.Multiplier != 1.0 {
+				multPart = fmt.Sprintf(" × %s", formatMultiplier(tc.Multiplier))
+			}
+			lines = append(lines, fmt.Sprintf("%s: %s tokens × %s/1M%s = %s",
+				row.label, formatInt(tc.Tokens), money(tc.UnitPrice), multPart, money(tc.Cost)))
+			if tc.Cost > 0 {
+				costParts = append(costParts, money(tc.Cost))
+			}
 		}
 
-		// 小计 × 倍率：展开各项费用明细，乘法链 = 租户倍率 × 时段乘数
+		// 倍率说明行 + 合计行。分项费用已含折扣，合计 = 各分项之和 = 实际费用（等式成立）。
+		// 不再展示「(分项之和) × 倍率 = 实际」——旧格式的分项是折后值，再乘倍率
+		// 呈现折上折观感，算式两边对不上（分项之和本就等于实际费用）
 		effTenant := snapshot.Multipliers.TenantMultiplier
 		effTime := snapshot.Multipliers.TimeMultiplier
 		if effTime <= 0 {
 			effTime = 1.0
 		}
 		if effTenant > 0 && (effTenant != 1.0 || effTime != 1.0) {
-			// 收集各项费用明细
-			var costParts []string
-			if tc, ok := snapshot.TokenCosts["input"]; ok && tc.Cost > 0 {
-				costParts = append(costParts, money(tc.Cost))
-			}
-			if tc, ok := snapshot.TokenCosts["output"]; ok && tc.Cost > 0 {
-				costParts = append(costParts, money(tc.Cost))
-			}
-			if tc, ok := snapshot.TokenCosts["cache_read"]; ok && tc.Cost > 0 {
-				costParts = append(costParts, money(tc.Cost))
-			}
-			if tc, ok := snapshot.TokenCosts["cache_creation"]; ok && tc.Cost > 0 {
-				costParts = append(costParts, money(tc.Cost))
-			}
-
-			// 构建倍率描述（租户倍率和时段乘数是并列关系，带文字标签）
-			multDesc := fmt.Sprintf("租户倍率(%.2f)", effTenant)
+			multDesc := fmt.Sprintf("已应用倍率: 租户倍率(%s)", formatMultiplier(effTenant))
 			if effTime != 1.0 {
-				multDesc += fmt.Sprintf(" × 时段乘数(%.2f)", effTime)
+				multDesc += fmt.Sprintf(" × 时段乘数(%s)", formatMultiplier(effTime))
 			}
-
-			// 展开格式：(abc + def + feg) × 倍率 = 总计；无逐项明细时按实际费用反推展示基数（仅用于展示，不影响实际计费）
-			costsExpr := ""
-			if len(costParts) > 1 {
-				costsExpr = fmt.Sprintf("(%s)", joinWithPlus(costParts))
-			} else if len(costParts) == 1 {
-				costsExpr = costParts[0]
-			} else if snapshot.Settlement.ActualCost > 0 {
-				costsExpr = money(snapshot.Settlement.ActualCost / (effTenant * effTime))
-			}
-
-			if costsExpr != "" {
-				lines = append(lines, fmt.Sprintf("小计: %s × %s = %s",
-					costsExpr, multDesc, money(snapshot.Settlement.ActualCost)))
-			}
+			lines = append(lines, multDesc)
+		}
+		if len(costParts) > 1 {
+			lines = append(lines, fmt.Sprintf("合计: (%s) = %s",
+				joinWithPlus(costParts), money(snapshot.Settlement.ActualCost)))
 		}
 	}
 
