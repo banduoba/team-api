@@ -44,7 +44,7 @@ func (s *sTenant) Dashboard(ctx context.Context, req *v1.TenantDashboardReq) (*v
 	err := dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("created_at >= ?", today+" 00:00:00").
-		Fields("COUNT(*) as requests, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(total_cost), 0) as total_cost").
+		Fields("COUNT(*) as requests, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost").
 		Scan(&todayRow)
 	if err != nil {
 		return nil, err
@@ -55,7 +55,7 @@ func (s *sTenant) Dashboard(ctx context.Context, req *v1.TenantDashboardReq) (*v
 	err = dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("created_at >= ?", monthStart+" 00:00:00").
-		Fields("COUNT(*) as requests, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(total_cost), 0) as total_cost").
+		Fields("COUNT(*) as requests, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost").
 		Scan(&monthRow)
 	if err != nil {
 		return nil, err
@@ -212,7 +212,7 @@ func (s *sTenant) TokenTrends(ctx context.Context, req *v1.TenantTokenTrendsReq)
 			COALESCE(SUM(input_tokens), 0) as input_tokens,
 			COALESCE(SUM(output_tokens), 0) as output_tokens,
 			COUNT(*) as requests,
-			COALESCE(SUM(total_cost), 0) as total_cost
+			COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost
 		FROM bil_usage_logs
 		WHERE tenant_id = ? AND created_at >= ?
 		GROUP BY DATE(created_at)
@@ -270,7 +270,7 @@ func (s *sTenant) ModelDistribution(ctx context.Context, req *v1.TenantModelDist
 			COUNT(*) as requests,
 			COALESCE(SUM(input_tokens), 0) as input_tokens,
 			COALESCE(SUM(output_tokens), 0) as output_tokens,
-			COALESCE(SUM(total_cost), 0) as total_cost
+			COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost
 		FROM bil_usage_logs
 		WHERE tenant_id = ? AND created_at >= ?
 		GROUP BY model_name
@@ -316,7 +316,7 @@ func (s *sTenant) BalancePrediction(ctx context.Context, req *v1.TenantBalancePr
 	err := dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("created_at >= ?", sevenDaysAgo+" 00:00:00").
-		Fields("COALESCE(SUM(total_cost), 0) as total_cost").
+		Fields("COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost").
 		Scan(&stats)
 	if err != nil {
 		return nil, err

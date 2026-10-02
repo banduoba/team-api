@@ -498,7 +498,7 @@ func (s *sTenant) ExportUsageLogs(ctx context.Context, req *v1.TenantUsageLogsEx
 		var cursorID int64
 		for {
 			dataSQL := `SELECT u.id, COALESCE(t.username, '') AS username, COALESCE(mdl.model_name, '') AS model_display_name, u.model_name, u.request_type,
-			        u.input_tokens, u.output_tokens, u.total_cost, u.status, u.created_at
+			        u.input_tokens, u.output_tokens, COALESCE(NULLIF(u.actual_cost, 0), u.total_cost) AS total_cost, u.status, u.created_at
 			 FROM ` + fromClause + ` WHERE ` + where
 			exportArgs := append([]any{}, args...)
 			if cursorID > 0 {

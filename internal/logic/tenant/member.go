@@ -109,7 +109,7 @@ func (s *sTenant) ListMembers(ctx context.Context, req *v1.TenantMemberListReq) 
 			Cost   float64 `json:"cost"`
 		}
 		if err = dao.BilUsageLogs.Ctx(ctx).
-			Fields("user_id, COALESCE(SUM(total_cost), 0) as cost").
+			Fields("user_id, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as cost").
 			Where("tenant_id", tenantID).
 			Where("user_id", userIds).
 			Where("created_at >= ?", monthStart).
@@ -1000,7 +1000,7 @@ func (s *sTenant) GetMemberUsage(ctx context.Context, req *v1.TenantMemberUsageR
 
 	// Today stats
 	todayRecord, err := dao.BilUsageLogs.Ctx(ctx).
-		Fields("COALESCE(COUNT(*), 0) as cnt, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(total_cost), 0) as total_cost").
+		Fields("COALESCE(COUNT(*), 0) as cnt, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost").
 		Where("tenant_id", tenantID).
 		Where("user_id", req.Id).
 		Where("created_at >= ?", today+" 00:00:00").
@@ -1011,7 +1011,7 @@ func (s *sTenant) GetMemberUsage(ctx context.Context, req *v1.TenantMemberUsageR
 
 	// Month stats
 	monthRecord, err := dao.BilUsageLogs.Ctx(ctx).
-		Fields("COALESCE(COUNT(*), 0) as cnt, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(total_cost), 0) as total_cost").
+		Fields("COALESCE(COUNT(*), 0) as cnt, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost").
 		Where("tenant_id", tenantID).
 		Where("user_id", req.Id).
 		Where("created_at >= ?", monthStart+" 00:00:00").
@@ -1228,7 +1228,7 @@ func (s *sTenant) ExportMembers(ctx context.Context, req *v1.TenantMemberExportR
 					Cost   float64 `json:"cost"`
 				}
 				if err = dao.BilUsageLogs.Ctx(ctx).
-					Fields("user_id, COALESCE(SUM(total_cost), 0) as cost").
+					Fields("user_id, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as cost").
 					Where("tenant_id", tenantID).
 					Where("user_id", userIds).
 					Where("created_at >= ?", monthStart).

@@ -55,7 +55,7 @@ func (s *sTenant) ModelComparison(ctx context.Context, req *v1.ModelComparisonRe
 				COUNT(*) FILTER (WHERE status = 'success') as success_count,
 				COALESCE(AVG(latency_ms) FILTER (WHERE status = 'success'), 0) as avg_latency,
 				COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) FILTER (WHERE status = 'success'), 0) as p95_latency,
-				COALESCE(SUM(total_cost), 0) as total_cost,
+				COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost,
 				COALESCE(SUM(input_tokens), 0) as input_tokens,
 				COALESCE(SUM(output_tokens), 0) as output_tokens
 			FROM bil_usage_logs
@@ -223,7 +223,7 @@ func fetchTrends(whereClause string, args []any) []v1.ModelTrendDay {
 				DATE(created_at) as day,
 				model_name,
 				COUNT(*) as requests,
-				COALESCE(SUM(total_cost), 0) as cost,
+				COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as cost,
 				COALESCE(AVG(latency_ms) FILTER (WHERE status = 'success'), 0) as latency
 			FROM bil_usage_logs
 			WHERE ` + whereClause + `

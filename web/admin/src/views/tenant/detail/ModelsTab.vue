@@ -144,6 +144,16 @@ const editModelForm = reactive({
 
 let suppressBillingWatch = false
 
+// 是否填写了任一自定义绝对价（一口价提示用：与折扣互斥，见 billing.hasTenantCustomPrice）
+const hasCustomPriceInput = computed(() =>
+	(editModelForm.custom_input_price ?? 0) > 0 ||
+	(editModelForm.custom_output_price ?? 0) > 0 ||
+	(editModelForm.custom_cache_read_price ?? 0) > 0 ||
+	(editModelForm.custom_cache_creation_price ?? 0) > 0 ||
+	(editModelForm.per_request_price ?? 0) > 0 ||
+	editModelForm.custom_pricing_tiers.length > 0,
+)
+
 function openEditModel(record: any) {
   suppressBillingWatch = true
   editingModel.value = record
@@ -484,6 +494,14 @@ defineExpose({ openPreviewModal })
           <AInputNumber v-model="editModelForm.discount_ratio" :min="0" :max="1" :step="0.05" :precision="2" placeholder="如 0.8 = 8折" class="w-full" />
         </AFormItem>
       </template>
+
+      <!-- 一口价提示：配置了自定义绝对价后折扣比例与等级折扣不再生效（防折上折） -->
+      <div
+        v-if="editModelForm.discount_ratio != null && editModelForm.discount_ratio !== 1 && hasCustomPriceInput"
+        style="margin-bottom: 12px; padding: 6px 10px; border-radius: 4px; background: var(--ta-bg-secondary, #f7f8fa); color: var(--ta-text-secondary); font-size: 12px"
+      >
+        已配置自定义价格（一口价）：折扣比例与租户等级折扣不会叠加生效，最终价即自定义价格
+      </div>
 
       <!-- Token 模式：自定义价格 -->
       <template v-if="editModelForm.billing_mode === 'token'">

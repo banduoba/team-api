@@ -833,3 +833,40 @@ func TestResolveTokenCounts_NilTokenDetails(t *testing.T) {
 		t.Errorf("expected (1000,500,0,0,0), got (%d,%d,%d,%d,%d)", baseIn, out, cr, cc5m, cc1h)
 	}
 }
+
+// TestHasTenantCustomPrice 一口价判定：存在实际生效的自定义绝对价时折扣乘数整体跳过（防折上折）。
+// 判定按计费模式收窄——惰性字段（如 token 模式下遗留的按次单价）不构成跳过条件，
+// per_second/special 恒 false（倍率是该模式下租户折扣的唯一手段）
+func TestHasTenantCustomPrice(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	tests := []struct {
+		name string
+		tm   *tenantModelRow
+		mode string
+		want bool
+	}{
+		{"nil 行", nil, "token", false},
+		{"空行", &tenantModelRow{}, "token", false},
+		{"自定义输入价", &tenantModelRow{CustomInputPrice: f(1.8)}, "token", true},
+		{"自定义输出价", &tenantModelRow{CustomOutputPrice: f(1.8)}, "token", true},
+		{"自定义缓存读价", &tenantModelRow{CustomCacheReadPrice: f(0.1)}, "token", true},
+		{"自定义缓存写价", &tenantModelRow{CustomCacheCreationPrice: f(0.3)}, "token", true},
+		{"零值自定义价不算", &tenantModelRow{CustomInputPrice: f(0)}, "token", false},
+		{"tiered 自定义阶梯", &tenantModelRow{CustomPricingTiers: `[{"min_tokens":0}]`}, "tiered", true},
+		{"tiered 空阶梯", &tenantModelRow{CustomPricingTiers: "[]"}, "tiered", false},
+		{"tiered null 阶梯", &tenantModelRow{CustomPricingTiers: "null"}, "tiered", false},
+		{"tiered 自定义缓存价仍算", &tenantModelRow{CustomCacheReadPrice: f(0.1)}, "tiered", true},
+		{"per_request 自定义按次价", &tenantModelRow{PerRequestPrice: f(0.5)}, "per_request", true},
+		{"per_request 遗留 token 价忽略", &tenantModelRow{CustomInputPrice: f(2)}, "per_request", false},
+		{"token 遗留按次价忽略", &tenantModelRow{PerRequestPrice: f(0.5)}, "token", false},
+		{"per_second 全部忽略", &tenantModelRow{CustomInputPrice: f(2), CustomOutputPrice: f(3), CustomCacheReadPrice: f(0.1), PerRequestPrice: f(0.5)}, "per_second", false},
+		{"special 全部忽略", &tenantModelRow{CustomInputPrice: f(2)}, BillingModeSpecial, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasTenantCustomPrice(tt.tm, tt.mode); got != tt.want {
+				t.Errorf("hasTenantCustomPrice(%s) = %v, want %v", tt.mode, got, tt.want)
+			}
+		})
+	}
+}

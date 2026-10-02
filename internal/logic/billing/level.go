@@ -207,11 +207,8 @@ func CheckAndUpgradeLevel(ctx context.Context, tenantID int64) error {
 		return err
 	}
 
-	// 7. 清除并发限制缓存
-	_, _ = g.Redis().Do(ctx, "DEL", fmt.Sprintf("tenant:conc_limit:%d", tenantID))
-
-	// 8. 清除该租户的价格缓存（级别变化可能影响折扣）
-	modelPriceCache.DeleteByPattern(ctx, fmt.Sprintf("%d:*", tenantID))
+	// 7. 清除该租户的价格缓存与并发限制缓存（级别变化影响折扣与并发上限）
+	InvalidateTenantLevelCaches(ctx, tenantID)
 
 	return nil
 }

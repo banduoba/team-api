@@ -804,8 +804,8 @@ func (s *sAdmin) wbCollectMetrics(ctx context.Context) []v1.WorkbenchMetric {
 	var todayCost, yesterdayCost float64
 	rows, err := g.DB().Ctx(ctx).Query(ctx,
 		`SELECT
-		    COALESCE(SUM(total_cost) FILTER (WHERE created_at >= date_trunc('day', NOW())), 0) AS today_cost,
-		    COALESCE(SUM(total_cost) FILTER (
+		    COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)) FILTER (WHERE created_at >= date_trunc('day', NOW())), 0) AS today_cost,
+		    COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)) FILTER (
 		        WHERE created_at >= date_trunc('day', NOW()) - INTERVAL '1 day'
 		          AND created_at < date_trunc('day', NOW()) - INTERVAL '1 day' + (NOW() - date_trunc('day', NOW()))
 		    ), 0) AS yesterday_cost

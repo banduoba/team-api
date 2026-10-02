@@ -60,6 +60,10 @@ func (s *sAdmin) CreateTenantLevelConfig(ctx context.Context, req *v1.TenantLeve
 	}
 
 	id, _ := result.LastInsertId()
+
+	// 等级号可能被存量租户持有（删配置不清租户级别值），重建配置后折扣需即时生效
+	billing.ClearLevelPriceCache(ctx, req.Level)
+
 	return &v1.TenantLevelConfigCreateRes{ID: id}, nil
 }
 
@@ -95,12 +99,28 @@ func (s *sAdmin) UpdateTenantLevelConfig(ctx context.Context, req *v1.TenantLeve
 		return &v1.TenantLevelConfigUpdateRes{}, nil
 	}
 
+	// price_multiplier 变更前取等级号，更新后按等级失效缓存
+	clearCache := req.PriceMultiplier != nil
+	var level int
+	if clearCache {
+		var config *entity.TntTenantLevelConfigs
+		_ = dao.TntTenantLevelConfigs.Ctx(ctx).Where("id", req.Id).Fields("level").Scan(&config)
+		if config != nil {
+			level = config.Level
+		}
+	}
+
 	_, err := dao.TntTenantLevelConfigs.Ctx(ctx).
 		Where("id", req.Id).
 		Data(data).
 		Update()
 	if err != nil {
 		return nil, err
+	}
+
+	// 折扣乘数变更即时生效：清除该等级下全部租户的价格缓存（否则旧折扣残留 ≤600s）
+	if clearCache && level > 0 {
+		billing.ClearLevelPriceCache(ctx, level)
 	}
 	return &v1.TenantLevelConfigUpdateRes{}, nil
 }
@@ -122,5 +142,10 @@ func (s *sAdmin) DeleteTenantLevelConfig(ctx context.Context, req *v1.TenantLeve
 	if err != nil {
 		return nil, err
 	}
+
+	// 删配置后该等级折扣失效（GetLevelPriceMultiplier 查不到配置返回 1.0），
+	// 存量租户的价格缓存仍烘焙旧折扣，需即时清除
+	billing.ClearLevelPriceCache(ctx, config.Level)
+
 	return &v1.TenantLevelConfigDeleteRes{}, nil
 }

@@ -459,7 +459,7 @@ func (s *sTenant) ProjectGet(ctx context.Context, req *v1.TenantProjectGetReq) (
 		Where("tenant_id", tenantID).
 		Where("project_id", req.Id).
 		Where("created_at >= date_trunc('month', NOW())").
-		Fields("COALESCE(SUM(total_cost), 0) as total_cost, COUNT(*) as request_count").
+		Fields("COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost, COUNT(*) as request_count").
 		Scan(&monthUsage)
 
 	// 预算已用：与 CheckProjectBudget 的执行口径同源（bil_transactions 累计实扣）。
@@ -680,7 +680,7 @@ func (s *sTenant) ProjectUsageStats(ctx context.Context, req *v1.TenantProjectUs
 	dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("project_id", req.Id).
-		Fields("COALESCE(SUM(total_cost), 0) as total_cost, COUNT(*) as request_count, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens").
+		Fields("COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost, COUNT(*) as request_count, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens").
 		Scan(&totalStats)
 
 	// 每日用量趋势（近30天）
@@ -696,7 +696,7 @@ func (s *sTenant) ProjectUsageStats(ctx context.Context, req *v1.TenantProjectUs
 		Where("tenant_id", tenantID).
 		Where("project_id", req.Id).
 		Where("created_at >= NOW() - INTERVAL '30 days'").
-		Fields("DATE(created_at) as date, COUNT(*) as request_count, COALESCE(SUM(total_cost), 0) as total_cost, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens").
+		Fields("DATE(created_at) as date, COUNT(*) as request_count, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens").
 		Group("DATE(created_at)").
 		OrderAsc("date").
 		Scan(&dailyStats)
@@ -714,7 +714,7 @@ func (s *sTenant) ProjectUsageStats(ctx context.Context, req *v1.TenantProjectUs
 	dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("project_id", req.Id).
-		Fields("model_name, COUNT(*) as request_count, COALESCE(SUM(total_cost), 0) as total_cost").
+		Fields("model_name, COUNT(*) as request_count, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost").
 		Group("model_name").
 		OrderDesc("total_cost").
 		Limit(10).
@@ -753,7 +753,7 @@ func (s *sTenant) ProjectUsageLogs(ctx context.Context, req *v1.TenantProjectUsa
 	err = dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("project_id", req.Id).
-		Fields("id, model_name, relay_mode, input_tokens, output_tokens, total_cost, latency_ms, status, error_message, created_at").
+		Fields("id, model_name, relay_mode, input_tokens, output_tokens, COALESCE(NULLIF(actual_cost, 0), total_cost) AS total_cost, latency_ms, status, error_message, created_at").
 		OrderDesc("created_at").
 		Page(page, pageSize).
 		ScanAndCount(&logs, &total, false)
