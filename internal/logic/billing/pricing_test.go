@@ -870,3 +870,61 @@ func TestHasTenantCustomPrice(t *testing.T) {
 		})
 	}
 }
+
+// TestApplyTenantModelDiscount 租户×模型行折扣解析：优先级与屏蔽规则
+func TestApplyTenantModelDiscount(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	tests := []struct {
+		name                          string
+		tm                            *tenantModelRow
+		mode                          string
+		wantMul, wantRatio            float64
+		wantCustomPriced, wantRatioEx bool
+	}{
+		{"nil 行", nil, "token", 1, 1, false, false},
+		{"未启用行", &tenantModelRow{DiscountRatio: f(0.9)}, "token", 1, 1, false, false},
+		{"全空行", &tenantModelRow{Enabled: true}, "token", 1, 1, false, false},
+		{"discount_ratio 0.9", &tenantModelRow{Enabled: true, DiscountRatio: f(0.9)}, "token", 0.9, 0.9, false, true},
+		{"显式 discount_ratio=1.0（不打折）", &tenantModelRow{Enabled: true, DiscountRatio: f(1.0)}, "token", 1, 1, false, true},
+		{"multiplier 1.2（加价）", &tenantModelRow{Enabled: true, Multiplier: f(1.2)}, "token", 1.2, 1.2, false, false},
+		{"discount_ratio 优先于 multiplier", &tenantModelRow{Enabled: true, DiscountRatio: f(0.9), Multiplier: f(1.2)}, "token", 0.9, 0.9, false, true},
+		{"一口价行跳过折扣", &tenantModelRow{Enabled: true, CustomInputPrice: f(1.8), DiscountRatio: f(0.9)}, "token", 1, 1, true, false},
+		{"per_second 保留 multiplier（无逐格价）", &tenantModelRow{Enabled: true, CustomInputPrice: f(2), Multiplier: f(0.8)}, "per_second", 0.8, 0.8, false, false},
+		{"per_request 一口价（自定义按次价）", &tenantModelRow{Enabled: true, PerRequestPrice: f(0.5), DiscountRatio: f(0.9)}, "per_request", 1, 1, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mul, ratio, customPriced, ratioEx := applyTenantModelDiscount(tt.tm, tt.mode)
+			if mul != tt.wantMul || ratio != tt.wantRatio || customPriced != tt.wantCustomPriced || ratioEx != tt.wantRatioEx {
+				t.Errorf("applyTenantModelDiscount() = (mul=%v ratio=%v customPriced=%v ratioExplicit=%v), want (%v %v %v %v)",
+					mul, ratio, customPriced, ratioEx, tt.wantMul, tt.wantRatio, tt.wantCustomPriced, tt.wantRatioEx)
+			}
+		})
+	}
+}
+
+// TestLevelFallbackApplies 等级折扣 fallback 适用判定：
+// 仅「完全未配置」的行才让等级折扣渗入
+func TestLevelFallbackApplies(t *testing.T) {
+	tests := []struct {
+		name         string
+		mul          float64
+		customPriced bool
+		ratioEx      bool
+		want         bool
+	}{
+		{"完全未配置 → 适用", 1.0, false, false, true},
+		{"已有折扣乘数 → 不适用", 0.9, false, false, false},
+		{"已有加价乘数 → 不适用", 1.2, false, false, false},
+		{"一口价 → 不适用", 1.0, true, false, false},
+		{"显式 discount_ratio → 不适用", 1.0, false, true, false},
+		{"一口价 + 显式 → 不适用", 1.0, true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := levelFallbackApplies(tt.mul, tt.customPriced, tt.ratioEx); got != tt.want {
+				t.Errorf("levelFallbackApplies(%v, %v, %v) = %v, want %v", tt.mul, tt.customPriced, tt.ratioEx, got, tt.want)
+			}
+		})
+	}
+}

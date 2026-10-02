@@ -141,6 +141,41 @@ func hasTenantCustomPrice(tm *tenantModelRow, mode string) bool {
 	return false
 }
 
+// applyTenantModelDiscount 租户×模型行折扣解析（纯函数，GetModelPriceAt 调用，便于单测）。
+// 返回 (tenantMultiplier, discountRatio, customPriced, ratioExplicit)：
+//   - 一口价行（hasTenantCustomPrice）整体跳过折扣，customPriced=true 供等级 fallback 屏蔽
+//   - discount_ratio 优先于 multiplier
+//   - ratioExplicit 标记显式配置过 discount_ratio（含 =1.0——可空列，nil 才是「未设置」），
+//     供等级 fallback 屏蔽：明确表达「不打折」的行不得被等级折扣渗入
+func applyTenantModelDiscount(tm *tenantModelRow, mode string) (tenantMultiplier, discountRatio float64, customPriced, ratioExplicit bool) {
+	tenantMultiplier, discountRatio = 1.0, 1.0
+	if tm == nil || !tm.Enabled {
+		return
+	}
+	customPriced = hasTenantCustomPrice(tm, mode)
+	if customPriced {
+		return
+	}
+	if tm.DiscountRatio != nil {
+		ratioExplicit = true
+		if *tm.DiscountRatio > 0 {
+			discountRatio = *tm.DiscountRatio
+			tenantMultiplier = *tm.DiscountRatio
+		}
+	} else if tm.Multiplier != nil && *tm.Multiplier > 0 {
+		tenantMultiplier = *tm.Multiplier
+		discountRatio = *tm.Multiplier
+	}
+	return
+}
+
+// levelFallbackApplies 等级折扣 fallback 适用判定（纯函数）：
+// 仅当租户×模型维度完全未配置折扣——乘数仍为 1.0、非一口价、未显式配置 discount_ratio——
+// 等级折扣才作为兜底生效。等级乘数的取值过滤见 GetLevelPriceMultiplier（仅 (0,1)）。
+func levelFallbackApplies(tenantMultiplier float64, customPriced, ratioExplicit bool) bool {
+	return tenantMultiplier == 1.0 && !customPriced && !ratioExplicit
+}
+
 // BillingModeSpecial 特殊计费模式（与 per_second 平级）：仅由特殊计费方案使用，
 // pricing JSONB 顶层必须同时声明 scheme 键（写侧双向配对校验）。计费分发只看
 // Scheme 不看此值，它用于展示层区分「按秒计费」与「特殊方案组合计费」，
@@ -364,16 +399,8 @@ func GetModelPriceAt(ctx context.Context, tenantID int64, modelName string, bill
 		return nil, gerror.Wrapf(err, "query tenant model price")
 	}
 
-	tenantMultiplier := 1.0
-	discountRatio := 1.0
 	billingSource := "base"
 	var customTiers []pricingTierRow
-	// customPriced：该行存在实际生效的自定义绝对价（一口价），折扣乘数整体跳过（防折上折）
-	customPriced := false
-	// ratioExplicit：显式配置过 discount_ratio（可空列，nil 才是「未设置」）。
-	// 显式 =1.0 表示「明确不打折」，必须屏蔽等级折扣 fallback——否则无法与「未设置」区分，
-	// 等级折扣会渗入。multiplier 列 NOT NULL DEFAULT 1.0 无法做此区分，不做屏蔽
-	ratioExplicit := false
 
 	if tm != nil && tm.Enabled {
 		billingSource = "tenant_custom"
@@ -404,27 +431,15 @@ func GetModelPriceAt(ctx context.Context, tenantID int64, modelName string, bill
 			_ = json.Unmarshal([]byte(tm.CustomPricingTiers), &customTiers)
 		}
 
-		// 折扣乘数：一口价行整体跳过（模式判定见 hasTenantCustomPrice）。
-		// discount_ratio 优先于 multiplier
-		customPriced = hasTenantCustomPrice(tm, billingMode)
-		if !customPriced {
-			if tm.DiscountRatio != nil {
-				ratioExplicit = true
-				if *tm.DiscountRatio > 0 {
-					discountRatio = *tm.DiscountRatio
-					tenantMultiplier = *tm.DiscountRatio
-				}
-			} else if tm.Multiplier != nil && *tm.Multiplier > 0 {
-				tenantMultiplier = *tm.Multiplier
-				discountRatio = *tm.Multiplier
-			}
-		}
-
 		// 租户覆盖按次单价
 		if tm.PerRequestPrice != nil && *tm.PerRequestPrice > 0 {
 			perRequestPrice = *tm.PerRequestPrice
 		}
 	}
+
+	// 折扣乘数解析（纯函数，见 applyTenantModelDiscount）：一口价行整体跳过、
+	// discount_ratio 优先于 multiplier；billingMode 已含租户级模式覆盖（resolved）
+	tenantMultiplier, discountRatio, customPriced, ratioExplicit := applyTenantModelDiscount(tm, billingMode)
 
 	// 2.5 平台阶梯兜底：租户未自定义阶梯时使用平台阶梯（pricing JSONB tiers 数组）。
 	// 计费模式非 tiered 时 computeCost 不会读取 CustomTiers，无副作用
@@ -432,11 +447,9 @@ func GetModelPriceAt(ctx context.Context, tenantID int64, modelName string, bill
 		customTiers = platformTiers
 	}
 
-	// 3.5 级别折扣 fallback：仅当租户×模型维度完全未配置折扣（无显式 discount_ratio、
-	// 无一口价、乘数仍为 1.0）时使用租户级别的 price_multiplier。
-	// 一口价行跳过（自定义绝对价已是终价，再乘等级折扣=折上折）；
-	// 显式 discount_ratio（含 =1.0）跳过（明确表达该行折扣意向，等级不得覆盖）
-	if tenantMultiplier == 1.0 && !customPriced && !ratioExplicit {
+	// 3.5 级别折扣 fallback：仅当租户×模型维度完全未配置折扣时使用租户级别的
+	// price_multiplier（适用判定见 levelFallbackApplies，等级值过滤见 GetLevelPriceMultiplier）
+	if levelFallbackApplies(tenantMultiplier, customPriced, ratioExplicit) {
 		levelMultiplier := GetLevelPriceMultiplier(ctx, tenantID)
 		levelMultiplierFloat := InexactFloat64(levelMultiplier)
 		if levelMultiplierFloat > 0 && levelMultiplierFloat < 1.0 {

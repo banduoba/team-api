@@ -45,6 +45,11 @@ func (s *sAdmin) CreateTenantLevelConfig(ctx context.Context, req *v1.TenantLeve
 	if count > 0 {
 		return nil, common.NewBadRequestError("等级号已存在")
 	}
+	// 折扣语义收口：等级乘数仅支持 (0,1]，>1 的加价计费引擎不会应用（GetLevelPriceMultiplier
+	// 归一化为 1.0），此处直接拒绝，避免「配置展示 1.5 但不生效」的口径分叉
+	if req.PriceMultiplier <= 0 || req.PriceMultiplier > 1 {
+		return nil, common.NewBadRequestError("价格乘数需在 (0,1] 区间（折扣，如 0.9=九折）")
+	}
 
 	result, err := dao.TntTenantLevelConfigs.Ctx(ctx).Insert(do.TntTenantLevelConfigs{
 		Level:                       req.Level,
@@ -97,6 +102,11 @@ func (s *sAdmin) UpdateTenantLevelConfig(ctx context.Context, req *v1.TenantLeve
 
 	if !hasUpdate {
 		return &v1.TenantLevelConfigUpdateRes{}, nil
+	}
+
+	// 折扣语义收口（同 CreateTenantLevelConfig）
+	if req.PriceMultiplier != nil && (*req.PriceMultiplier <= 0 || *req.PriceMultiplier > 1) {
+		return nil, common.NewBadRequestError("价格乘数需在 (0,1] 区间（折扣，如 0.9=九折）")
 	}
 
 	// price_multiplier 变更前取等级号，更新后按等级失效缓存
