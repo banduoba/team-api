@@ -33,7 +33,8 @@ func testUsageTask() *common.AsyncTask {
 }
 
 // TestBuildTaskUsageRecord_CostColumnSemantics 费用列口径与同步链路（relay_handler）严格一致：
-//   - total_cost  = settleResult.BaseCost（折扣前基础费用）；
+//   - total_cost  = settleResult.BaseCost（不含租户/时段折扣的基础费用，任务行
+//     仍含请求级附加乘数，见 billing.preMultiplierCost）；
 //   - actual_cost = 折扣后实际扣款。
 //
 // 此前任务路径把 actual 同时写进两列，折扣租户下 SUM(total_cost) 类趋势统计

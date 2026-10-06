@@ -641,31 +641,48 @@ func settleSyncImageSuccess(ctx context.Context, job *SyncImageJob, sel *common.
 		return
 	}
 
-	// 2. 结算钱包（传真实 token 用量：驱动 bil_records.output_tokens 与计费快照的 token 明细；
+	// 2. 结算前先持久化重算出的实际费用（与 pollSingleTask 同一原则）：结算失败或已结算
+	// 标记落库失败的窗口，重试网按已落库的同金额重放——ActualCost 缺席时重试回落预扣额，
+	// 补写的用量日志/任务行会与钱包实际扣款漂移
+	costPersist := &common.AsyncTask{
+		ID:         job.TaskID,
+		Status:     "SUCCESS",
+		Progress:   "100%",
+		ResultURL:  resultURL,
+		Data:       normalized,
+		FinishTime: &now,
+		ActualCost: actualCost,
+	}
+	costPersisted := DefaultAsyncProvider.UpdateTask(ctx, costPersist) == nil
+	if !costPersisted {
+		g.Log().Warningf(ctx, "sync_image: task %s persist actual cost failed", job.PublicTaskID)
+	}
+
+	// 3. 结算钱包（传真实 token 用量：驱动 bil_records.output_tokens 与计费快照的 token 明细；
 	// billAt=提交时刻，时段定价按受理时刻计价。图片任务无素材计量，usage 传 nil）。
-	// 用量日志写入原则与 pollSingleTask 一致：结算成功且 billing_settled 落库成功才写，
+	// 用量日志写入原则与 pollSingleTask 一致：结算成功且「已结算」标记抢占成功才写，
 	// 否则延后到 handleUnsettledSyncImage 重试结算成功后补写（防金额漂移/双条记录）
 	settleResult, serr := syncImageBilling.SettleTaskSuccess(ctx, job.TenantID, job.UserID, job.ApiKeyID, sel.ChannelID,
 		job.Model, job.RequestID, actualCost, job.PreDeductAmount, totalTokens, completionTokens, nil, job.Ratios, job.PublicTaskID, job.SubmitTime)
 	usageLogDeferred := false
 	if serr != nil {
-		// 保留 billing_settled=false，由未结算兜底网重放结算
+		// 保留 billing_settled=false，由未结算兜底网重放结算；上面的持久化失败时补试一次
 		g.Log().Warningf(ctx, "sync_image: task %s settle success failed (unsettled net will retry): %v", job.PublicTaskID, serr)
 		usageLogDeferred = true
+		if !costPersisted {
+			if uErr := DefaultAsyncProvider.UpdateTask(ctx, costPersist); uErr != nil {
+				g.Log().Warningf(ctx, "sync_image: task %s persist actual cost retry failed: %v", job.PublicTaskID, uErr)
+			}
+		}
 	} else {
-		// 3. 标记已结算
-		if uErr := DefaultAsyncProvider.UpdateTask(ctx, &common.AsyncTask{
-			ID:             job.TaskID,
-			Status:         "SUCCESS",
-			Progress:       "100%",
-			ResultURL:      resultURL,
-			Data:           normalized,
-			FinishTime:     &now,
-			BillingSettled: true,
-			ActualCost:     actualCost,
-		}); uErr != nil {
+		// 4. CAS 抢占「已结算」标记：赢家负责写用量日志，输家说明重试网已抢先标记并补写。
+		// 额度随扣款累计（与标记解耦）：标记竞争落败时重试按 DuplicateSkip 跳过，恰好一次
+		claimed, mErr := DefaultAsyncProvider.MarkTaskSettled(ctx, &common.AsyncTask{ID: job.TaskID, ActualCost: actualCost})
+		if mErr != nil {
 			// settled 未落库：重试网按 DuplicateSkip 重放并补写用量日志，此处写会双条
-			g.Log().Warningf(ctx, "sync_image: task %s persist settled failed, defer usage log: %v", job.PublicTaskID, uErr)
+			g.Log().Warningf(ctx, "sync_image: task %s mark settled failed, defer usage log: %v", job.PublicTaskID, mErr)
+			usageLogDeferred = true
+		} else if !claimed {
 			usageLogDeferred = true
 		}
 		// 幂等重复结算（DuplicateSkip）不得重复累加 Key 额度（额度随扣款累计，与落库结果解耦）
@@ -781,9 +798,12 @@ func buildImageResult(ctx context.Context, job *SyncImageJob, body []byte) (resu
 
 	resultURL = outData[0].URL
 	// 归一化落库：存全部结果 URL（不含大体积 b64 原文），供 fetch 吐 data 数组。
+	// usage 一并保留：上游 token 计量随任务行持久化，重试结算时经 extractImageUsage
+	// 从 t.Data 重解析回收（handleUnsettledSyncImage），fetch 响应只吐 data 数组不透传
 	normalized, _ = json.Marshal(dto.ImageResponse{
 		Created: imgResp.Created,
 		Data:    outData,
+		Usage:   imgResp.Usage,
 	})
 	return resultURL, normalized, nil
 }

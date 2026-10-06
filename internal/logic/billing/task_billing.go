@@ -376,7 +376,13 @@ type PerSecondFacts struct {
 // collectTaskBillingFacts 从计费上下文与素材计量提取任务计费要素：
 // 附加乘数按 wrapSchemeCost / RecalculateByTokens 的同一过滤口径提取（跳过 duration/resolution——
 // 时长已体现在秒数/token 中，resolution 为乘数语义的存量键；spec.* 为事实值非乘数），
-// 按秒命中明细仅在按秒矩阵参与定价（查价 > 0）时记录，避免对非按秒计价的任务误导
+// 按秒命中明细仅在按秒矩阵参与定价（查价 > 0）时记录，避免对非按秒计价的任务误导。
+//
+// 复算等式「数量 × 单价 × 乘数链 = 费用」成立的前提：实际费用确经 wrapSchemeCost
+// （预扣估算对所有模式统一套用，含 per_request；素材重算同）或 RecalculateByTokens
+// 产生——当前全部任务适配器均满足（无一填充上游 ActualCost，minimax 适配器还显式
+// 断言其为 0）。若未来接入上游直接报价（taskInfo.ActualCost > 0），金额语义由上游
+// 决定，乘数链等式不再保证，届时需同步调整快照要素的采集条件
 func collectTaskBillingFacts(pricing *PricingResult, ratios map[string]any, usage *common.TaskMaterialUsage) *TaskBillingFacts {
 	facts := &TaskBillingFacts{
 		AppliedRatios: appliedRatioMultipliers(ratios, "duration", "resolution"),
@@ -455,8 +461,9 @@ func buildTaskCostBreakdown(ctx context.Context, pricing *PricingResult, actualC
 		return bd
 	}
 
-	// per_second / special（特殊方案）模式：无 token 语义，费用整体记 BaseCost（折扣前成本），
-	// 与 per_request 快照口径一致。命中档的每秒价在预扣时已消费，此处不重复记录
+	// per_second / special（特殊方案）模式：无 token 语义，费用整体记 BaseCost（折前成本，
+	// 含请求级附加乘数，见 preMultiplierCost），与 per_request 快照口径一致。命中档的每秒价
+	// 在预扣时已消费，此处不重复记录
 	// （CostBreakdown 无单价字段先例）；special 若漏此分支会落 token 路径，生成
 	// 「N tokens × $0」的自相矛盾快照行
 	if pricing.BillingMode == "per_second" || pricing.BillingMode == BillingModeSpecial {
@@ -483,9 +490,11 @@ func buildTaskCostBreakdown(ctx context.Context, pricing *PricingResult, actualC
 	return bd
 }
 
-// preMultiplierCost 把已含「租户乘数 × 时段乘数」的实际费用还原为折扣前成本（BaseCost 语义）。
-// actualCost 来自 RecalculateByTokens（已乘全部乘数）或预扣额（EstimatePreDeductAmount 同样含乘数），
-// 还原时两个乘数都要除，与 computeCost 的 BaseCost = 折扣前小计语义对齐
+// preMultiplierCost 把已含「租户乘数 × 时段乘数」的实际费用还原为折前成本（BaseCost 语义）。
+// actualCost 来自 RecalculateByTokens（已乘全部乘数）或预扣额（estimateTaskCost 经
+// wrapSchemeCost 同样含乘数），还原时两个乘数都要除；请求级附加乘数（video_input 折扣、
+// quality 倍率等）保留不除——它们属请求定价结构而非账户折扣，任务行 BaseCost =
+// 列价 × 附加乘数链。同步对话路径无 ratios，两处 BaseCost 语义在该前提下对齐
 func preMultiplierCost(actualCost float64, pricing *PricingResult) float64 {
 	mul := pricing.TenantMultiplier * effectiveTimeMultiplier(pricing)
 	if mul <= 0 {
