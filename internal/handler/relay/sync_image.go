@@ -115,8 +115,15 @@ func HandleSyncImageSubmit(r *ghttp.Request, body []byte, rc *relay_handler.Task
 		actualPlatform = relay_constant.TaskPlatform(strings.ToLower(providerType.String()))
 	}
 
+	// relay_mode 随任务持久化（入口 HandleAliImageSubmit 已设为图片模式），结算写用量日志时还原；
+	// 防御性回退：入口未设时按图片模式落（本管线只服务图片请求）
+	syncImageRelayMode := rc.RelayMode
+	if syncImageRelayMode == 0 {
+		syncImageRelayMode = int(relay_constant.RelayModeImagesGenerations)
+	}
 	privateData, _ := json.Marshal(map[string]any{
-		"task_type": string(relay_constant.TaskPlatformSyncImage),
+		"task_type":  string(relay_constant.TaskPlatformSyncImage),
+		"relay_mode": syncImageRelayMode,
 		"billing_context": map[string]any{
 			"ratios":     nil,
 			"model_name": modelName,

@@ -225,7 +225,10 @@ func (GenericScheme) EstimateTaskCost(pricing *PricingResult, ratios map[string]
 		costD = baseTokensPerSec.Mul(durationD).Mul(resolutionMulD).
 			Div(million).
 			Mul(NewFromFloat(pricing.OutputPrice)).
-			Mul(NewFromFloat(pricing.TenantMultiplier))
+			Mul(NewFromFloat(pricing.TenantMultiplier)).
+			// 时段乘数与 per_second/per_request 分支及结算的 RecalculateByTokens 同口径
+			//（此前漏乘：时段折扣生效时预扣按原价冻结，结算再退差）
+			Mul(NewFromFloat(effectiveTimeMultiplier(pricing)))
 	default:
 		// 无时长信号（图片等扁平计费任务）：优先按次单价（同样乘租户/时段乘数，
 		// 预扣即终价的口径与 per_request 分支一致）；未配按次价时用占位预扣，

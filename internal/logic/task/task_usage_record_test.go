@@ -1,12 +1,14 @@
 package task
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/qianfree/team-api/internal/logic/billing"
 	"github.com/qianfree/team-api/relay/common"
+	"github.com/qianfree/team-api/relay/constant"
 )
 
 func testUsageTask() *common.AsyncTask {
@@ -20,6 +22,7 @@ func testUsageTask() *common.AsyncTask {
 		ApiKeyID:         3,
 		ChannelID:        4,
 		ModelName:        "wan2.5-t2v",
+		UpstreamModel:    "wan2.5-t2v-upstream",
 		PreDeductAmount:  billing.NewFromFloat(2.5),
 		SubmitTime:       &submit,
 		FinishTime:       &finish,
@@ -71,6 +74,13 @@ func TestBuildTaskUsageRecord_CostColumnSemantics(t *testing.T) {
 	if rec.BillingMode != "per_second" || rec.BillingSource != "base" {
 		t.Errorf("billing meta = %q/%q, want per_second/base", rec.BillingMode, rec.BillingSource)
 	}
+	// 模型列与同步链路对齐：requested=用户请求模型，upstream=渠道映射后模型
+	if rec.RequestedModel != "wan2.5-t2v" {
+		t.Errorf("RequestedModel = %q, want wan2.5-t2v", rec.RequestedModel)
+	}
+	if rec.UpstreamModel != "wan2.5-t2v-upstream" {
+		t.Errorf("UpstreamModel = %q, want wan2.5-t2v-upstream", rec.UpstreamModel)
+	}
 	if rec.Currency == "" {
 		t.Error("Currency should be set (本位币)")
 	}
@@ -100,8 +110,56 @@ func TestBuildTaskUsageRecord_FailureZeroCost(t *testing.T) {
 	if rec.BillingMode == "" {
 		t.Error("BillingMode should fall back to per_request, got empty")
 	}
+	// billing_source 统一为定价来源语义：失败行不再写 "task" 标记（无 DB 环境回退空来源）
+	if rec.BillingSource == "task" {
+		t.Errorf("BillingSource = %q, want pricing-source semantics (empty on lookup failure), not \"task\"", rec.BillingSource)
+	}
 	if rec.PreDeductAmount != 2.5 {
 		t.Errorf("PreDeductAmount = %v, want 2.5 (退款痕迹)", rec.PreDeductAmount)
+	}
+}
+
+// TestBuildTaskUsageRecord_RelayMode relay_mode 随任务 private_data 持久化、结算时还原：
+// 显式持久化值优先；存量任务按类型回退——sync_image（图片异步化）回退图片模式
+// （此前硬编码视频模式属误记），其余回退视频模式保持既有行为。
+func TestBuildTaskUsageRecord_RelayMode(t *testing.T) {
+	task := testUsageTask()
+	task.ActualCost = billing.NewFromFloat(1.0)
+	settle := &common.SettlementResult{BaseCost: 1.0, ActualCost: 1.0}
+
+	// 1. 显式持久化 /v1/videos 模式 → 还原 Videos（而非硬编码 VideoGenerations）
+	task.PrivateData = []byte(fmt.Sprintf(`{"relay_mode": %d, "billing_context": {"ratios": {}}}`, int(constant.RelayModeVideos)))
+	rec := buildTaskUsageRecord(task, nil, true, "", settle)
+	if rec.RelayMode != int(constant.RelayModeVideos) {
+		t.Errorf("RelayMode = %d, want %d (persisted /v1/videos)", rec.RelayMode, int(constant.RelayModeVideos))
+	}
+
+	// 2. 存量视频任务（无 relay_mode）→ 回退 VideoGenerations（既有行为）
+	task.PrivateData = []byte(`{"billing_context": {"ratios": {}}}`)
+	rec = buildTaskUsageRecord(task, nil, true, "", settle)
+	if rec.RelayMode != int(constant.RelayModeVideoGenerations) {
+		t.Errorf("RelayMode = %d, want %d (legacy video fallback)", rec.RelayMode, int(constant.RelayModeVideoGenerations))
+	}
+
+	// 3. 存量 sync_image 任务（无 relay_mode）→ 回退图片模式（此前误记视频模式）
+	task.PrivateData = []byte(`{"task_type": "sync_image", "billing_context": {"ratios": {}}}`)
+	rec = buildTaskUsageRecord(task, nil, true, "", settle)
+	if rec.RelayMode != int(constant.RelayModeImagesGenerations) {
+		t.Errorf("RelayMode = %d, want %d (sync_image image fallback)", rec.RelayMode, int(constant.RelayModeImagesGenerations))
+	}
+
+	// 4. sync_image 任务显式持久化了非图片模式 → 持久化值优先于类型回退
+	task.PrivateData = []byte(fmt.Sprintf(`{"task_type": "sync_image", "relay_mode": %d, "billing_context": {"ratios": {}}}`, int(constant.RelayModeSunoSubmit)))
+	rec = buildTaskUsageRecord(task, nil, true, "", settle)
+	if rec.RelayMode != int(constant.RelayModeSunoSubmit) {
+		t.Errorf("RelayMode = %d, want %d (persisted value wins over type fallback)", rec.RelayMode, int(constant.RelayModeSunoSubmit))
+	}
+
+	// 5. 无 private_data → 视频回退
+	task.PrivateData = nil
+	rec = buildTaskUsageRecord(task, nil, true, "", settle)
+	if rec.RelayMode != int(constant.RelayModeVideoGenerations) {
+		t.Errorf("RelayMode = %d, want %d (no private_data fallback)", rec.RelayMode, int(constant.RelayModeVideoGenerations))
 	}
 }
 

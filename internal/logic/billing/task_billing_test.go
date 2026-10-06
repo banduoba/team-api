@@ -364,3 +364,22 @@ func TestLookupPerSecondPrice(t *testing.T) {
 		t.Errorf("wildcard after case-insensitive miss = %v", p)
 	}
 }
+
+// TestEstimateTaskCost_VideoTimeMultiplier token 视频预扣估算必须乘时段乘数，
+// 与 per_second/per_request 分支及结算的 RecalculateByTokens 口径一致
+// （此前漏乘：时段折扣生效时预扣按原价冻结，结算再退差）。
+func TestEstimateTaskCost_VideoTimeMultiplier(t *testing.T) {
+	pricing := &PricingResult{
+		BillingMode:      "token",
+		OutputPrice:      30.0,
+		TenantMultiplier: 1.0,
+		TimeMultiplier:   0.5,
+	}
+	ratios := map[string]any{"duration": 5.0, "resolution": 2.25}
+	// 5s × 2.25 × 10000 tokens/s = 112500 tokens × $30/1M = $3.375 × 0.5(时段) = 1.6875
+	assertDecimal(t, estimateTaskCost(pricing, ratios, nil), 1.6875, "video estimate with time multiplier")
+
+	// 时段乘数零值（旧缓存条目缺字段）兜底 1.0，预扣不得清零
+	pricing.TimeMultiplier = 0
+	assertDecimal(t, estimateTaskCost(pricing, ratios, nil), 3.375, "zero time multiplier fallback")
+}

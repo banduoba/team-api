@@ -595,12 +595,18 @@ func buildTaskUsageRecord(task *common.AsyncTask, channel *common.ChannelBasicIn
 	// 提取上游请求 ID 落用量日志（排障时凭它在上游定位任务）：
 	// 优先 upstream_request_id（上游调用追踪 ID，如 DashScope 顶层 request_id），
 	// 未记录时回退 upstream_task_id（任务句柄，轮询同款标识）
+	// relay_mode 取提交时随任务持久化的入站模式（/v1/videos、/suno/submit、图片异步化各不相同），
+	// 存量任务未持久化时按任务类型回退——sync_image 是图片请求（此前硬编码视频模式属误记），
+	// 其余回退视频模式保持既有行为
 	durationSeconds := 0
 	upstreamRequestID := ""
+	relayMode := int(constant.RelayModeVideoGenerations)
 	if len(task.PrivateData) > 0 {
 		var pdDur struct {
-			UpstreamTaskID    string `json:"upstream_task_id"`
-			UpstreamRequestID string `json:"upstream_request_id"`
+			UpstreamTaskID    string  `json:"upstream_task_id"`
+			UpstreamRequestID string  `json:"upstream_request_id"`
+			TaskType          string  `json:"task_type"`
+			RelayMode         float64 `json:"relay_mode"`
 			BillingContext    struct {
 				Ratios map[string]any `json:"ratios"`
 			} `json:"billing_context"`
@@ -613,6 +619,12 @@ func buildTaskUsageRecord(task *common.AsyncTask, channel *common.ChannelBasicIn
 			if v, ok := pdDur.BillingContext.Ratios["spec.duration"].(float64); ok && v > 0 {
 				durationSeconds = int(v)
 			}
+			if pdDur.TaskType == string(constant.TaskPlatformSyncImage) {
+				relayMode = int(constant.RelayModeImagesGenerations)
+			}
+			if pdDur.RelayMode > 0 {
+				relayMode = int(pdDur.RelayMode)
+			}
 		}
 	}
 
@@ -624,13 +636,18 @@ func buildTaskUsageRecord(task *common.AsyncTask, channel *common.ChannelBasicIn
 		ChannelName: channelName,
 		ChannelType: channelType,
 		ModelName:   task.ModelName,
-		RelayMode:   int(constant.RelayModeVideoGenerations),
+		RelayMode:   relayMode,
 		RequestType: 3, // async
 		LatencyMs:   float64(latencyMs),
 		IsStream:    false,
 		Success:     success,
 		RequestID:   task.RequestID,
 		Status:      status,
+		// 模型列与同步链路对齐：requested_model 为用户请求模型（任务行即请求模型），
+		// upstream_model 为渠道映射后的上游模型（提交时持久化于任务行）。
+		// 此前两列全空，租户端按回显模型筛选时任务行不可见
+		RequestedModel: task.ModelName,
+		UpstreamModel:  task.UpstreamModel,
 		// errMsg 可能来自上游 FailReason 原文，租户端用量日志可见，抹除其中的 URL/IP
 		ErrorMessage:     helper.RedactMessage(errMsg),
 		PromptTokens:     task.PromptTokens,
@@ -639,7 +656,6 @@ func buildTaskUsageRecord(task *common.AsyncTask, channel *common.ChannelBasicIn
 		TotalCost:        billing.InexactFloat64(task.ActualCost),
 		ActualCost:       billing.InexactFloat64(task.ActualCost),
 		PreDeductAmount:  billing.InexactFloat64(task.PreDeductAmount),
-		BillingSource:    "task",
 		TaskID:           task.PublicTaskID,
 
 		DurationSeconds: durationSeconds,
@@ -664,27 +680,33 @@ func buildTaskUsageRecord(task *common.AsyncTask, channel *common.ChannelBasicIn
 		// 与 relay_handler 的 BaseCost 口径分叉，见函数头注释）
 		record.TotalCost = settleResult.BaseCost
 	} else {
-		// 失败/超时任务：从定价中获取计费模式（仅展示用，取价失败回退 per_request）
-		record.BillingMode = failedTaskBillingMode(context.Background(), task.TenantID, task.ModelName)
+		// 失败/超时任务：从定价中获取计费模式与定价来源（仅展示用，取价失败回退默认值）。
+		// billing_source 统一为定价来源语义——此前失败行写 "task"、成功行写定价来源，
+		// 同一端点成败两态在前端「定价来源」列显示不同维度的值
+		record.BillingMode, record.BillingSource = failedTaskBillingMeta(context.Background(), task.TenantID, task.ModelName)
 	}
 
 	return record
 }
 
-// failedTaskBillingMode 失败/超时任务的计费模式（仅用于用量日志展示）。
-// 配置基础设施不可用（如单测环境无 DB 驱动，g.DB() 直接 panic）时回退 per_request，
-// 与 billing.Currency 的单测兜底惯例一致，保证 buildTaskUsageRecord 纯函数可测
-func failedTaskBillingMode(ctx context.Context, tenantID int64, modelName string) (mode string) {
-	mode = "per_request"
+// failedTaskBillingMeta 失败/超时任务的计费模式与定价来源（仅用于用量日志展示）。
+// 配置基础设施不可用（如单测环境无 DB 驱动，g.DB() 直接 panic）时回退默认值
+// （per_request / 空来源），与 billing.Currency 的单测兜底惯例一致，
+// 保证 buildTaskUsageRecord 纯函数可测
+func failedTaskBillingMeta(ctx context.Context, tenantID int64, modelName string) (mode, source string) {
+	mode, source = "per_request", ""
 	defer func() {
 		if r := recover(); r != nil {
-			// 保持默认值（per_request）
+			// 保持默认值（per_request / 空来源）
 		}
 	}()
-	if pricing, err := billing.GetModelPrice(ctx, tenantID, modelName); err == nil && pricing.BillingMode != "" {
-		mode = pricing.BillingMode
+	if pricing, err := billing.GetModelPrice(ctx, tenantID, modelName); err == nil {
+		if pricing.BillingMode != "" {
+			mode = pricing.BillingMode
+		}
+		source = pricing.BillingSource
 	}
-	return mode
+	return mode, source
 }
 
 // recordTaskCompletionAudit 更新提交阶段写入的审计记录，补充异步任务最终结果

@@ -196,7 +196,10 @@ func (b *TaskBillingProviderImpl) SettleTaskSuccess(ctx context.Context, tenantI
 	if pricing != nil {
 		billingMode = pricing.BillingMode
 		discountRatio = pricing.DiscountRatio
-		effectiveOutputPrice = pricing.OutputPrice
+		// 快照单价乘租户乘数，与同步路径 createBillingRecord 的 outputSnapPrice
+		//（pricingResult.OutputPrice × TenantMultiplier）口径对齐——此前直取原价，
+		// 折扣租户的 bil_records.output_price 与同步行语义分叉
+		effectiveOutputPrice = pricing.OutputPrice * pricing.TenantMultiplier
 	}
 
 	// 3. 执行结算（幂等闸门 → Redis 认领扣款 → 流水）

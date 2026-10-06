@@ -348,6 +348,9 @@ func HandleAliImageSubmit(r *ghttp.Request) {
 		KeyIpWhitelist:  r.GetCtxVar(middleware.CtxKeyApiKeyIpWhitelist).String(),
 		KeyTotalQuota:   r.GetCtxVar(middleware.CtxKeyApiKeyTotalQuota).Float64(),
 		KeyUsedQuota:    r.GetCtxVar(middleware.CtxKeyApiKeyUsedQuota).Float64(),
+		// 图片生成端点（含同步厂商异步化）：relay 模式为图片而非任务管线的视频回退值，
+		// 随任务 private_data 持久化，终态结算写用量日志时还原
+		RelayMode: int(relay_constant.RelayModeImagesGenerations),
 	}
 
 	channelMeta, err := selectTaskChannel(r, body)
