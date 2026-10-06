@@ -168,9 +168,10 @@ func (b *TaskBillingProviderImpl) CheckApiKeyQuota(ctx context.Context, apiKeyID
 
 // SettleTaskSuccess 任务成功结算（含计费快照）
 // totalTokens/completionTokens: 上游返回的 token 用量
-// ratios: 提交时保存的计费上下文（如 video_input 折扣）
+// usage: 上游返回的素材计量（实际输出秒数/分辨率，nil = 未提供），供快照按秒命中明细
+// ratios: 提交时保存的计费上下文（如 video_input 折扣），实际应用的附加乘数随快照留痕
 // billAt: 任务受理时刻（时段定价按该时刻评估；零值按当前时刻兜底）
-func (b *TaskBillingProviderImpl) SettleTaskSuccess(ctx context.Context, tenantID, userID, apiKeyID, channelID int64, modelName, requestID string, actualCost, preDeductAmount decimal.Decimal, totalTokens, completionTokens int, ratios map[string]any, taskID string, billAt time.Time) (*common.SettlementResult, error) {
+func (b *TaskBillingProviderImpl) SettleTaskSuccess(ctx context.Context, tenantID, userID, apiKeyID, channelID int64, modelName, requestID string, actualCost, preDeductAmount decimal.Decimal, totalTokens, completionTokens int, usage *common.TaskMaterialUsage, ratios map[string]any, taskID string, billAt time.Time) (*common.SettlementResult, error) {
 	diff := SubtractMoney(actualCost, preDeductAmount)
 
 	// 1. 获取钱包
@@ -179,9 +180,16 @@ func (b *TaskBillingProviderImpl) SettleTaskSuccess(ctx context.Context, tenantI
 		return nil, fmt.Errorf("settle task: get wallet: %w", err)
 	}
 
-	// 2. 获取定价（事务外只读，按任务受理时刻评估时段乘数）
-	pricing, _ := GetModelPriceAt(ctx, tenantID, modelName, billAt)
-	breakdown := buildTaskCostBreakdown(ctx, pricing, InexactFloat64(actualCost), totalTokens, completionTokens)
+	// 2. 获取定价（事务外只读，按任务受理时刻评估时段乘数）。
+	// 取价失败不阻断结算（金额已由调用方按重算/预扣口径确定，拒绝扣款会让已完成的任务免费），
+	// 但快照与 bil_records 定价信息会缺失，必须留痕供对账排查（与同步路径 SettleWithUsage 的
+	// fail-closed 日志口径对齐）
+	pricing, pricingErr := GetModelPriceAt(ctx, tenantID, modelName, billAt)
+	if pricingErr != nil {
+		g.Log().Errorf(ctx, "settle task: get price failed, request=%s model=%s billAt=%s: %v (settling without snapshot)",
+			requestID, modelName, billAt.Format("2006-01-02 15:04:05"), pricingErr)
+	}
+	breakdown := buildTaskCostBreakdown(ctx, pricing, InexactFloat64(actualCost), totalTokens, completionTokens, ratios, usage)
 
 	var billingMode string
 	var discountRatio, effectiveOutputPrice float64
@@ -266,16 +274,23 @@ func (b *TaskBillingProviderImpl) SettleTaskSuccess(ctx context.Context, tenantI
 	})
 	if err != nil {
 		if errors.Is(err, errAlreadySettled) {
-			// 幂等跳过：该任务此前已结算完成，本次为重复调用（轮询/重放），不再扣款/写账单
+			// 幂等跳过：该任务此前已结算完成，本次为重复调用（轮询/重放），不再扣款/写账单。
+			// 仍补齐退补差与快照/计费元数据：重试结算路径可能要补写用量日志，
+			// 其口径必须与首次结算完全一致（含 total_cost 的 BaseCost 语义）
 			g.Log().Warningf(ctx, "settle task: duplicate settlement skipped for request=%s (idempotent)", requestID)
-			return &common.SettlementResult{
-				PreDeductAmount: InexactFloat64(preDeductAmount),
-				ActualCost:      InexactFloat64(actualCost),
-				BaseCost:        breakdown.BaseCost,
-				TotalCost:       InexactFloat64(actualCost),
-				OutputCost:      breakdown.OutputCost,
-				DuplicateSkip:   true,
-			}, nil
+			refundAmt, supplementAmt := calcSettlementDiff(InexactFloat64(preDeductAmount), InexactFloat64(actualCost))
+			result := &common.SettlementResult{
+				PreDeductAmount:  InexactFloat64(preDeductAmount),
+				ActualCost:       InexactFloat64(actualCost),
+				BaseCost:         breakdown.BaseCost,
+				TotalCost:        InexactFloat64(actualCost),
+				OutputCost:       breakdown.OutputCost,
+				RefundAmount:     refundAmt,
+				SupplementAmount: supplementAmt,
+				DuplicateSkip:    true,
+			}
+			attachTaskSnapshot(ctx, result, pricing, breakdown, modelName)
+			return result, nil
 		}
 		return nil, err
 	}
@@ -305,29 +320,115 @@ func (b *TaskBillingProviderImpl) SettleTaskSuccess(ctx context.Context, tenantI
 	} else if diff.LessThan(threshold.Neg()) {
 		result.RefundAmount = InexactFloat64(diff.Neg())
 	}
-
-	if pricing != nil {
-		internalSettlement := &SettlementResult{
-			PreDeductAmount:  InexactFloat64(preDeductAmount),
-			ActualCost:       InexactFloat64(actualCost),
-			BaseCost:         breakdown.BaseCost,
-			RefundAmount:     result.RefundAmount,
-			SupplementAmount: result.SupplementAmount,
-		}
-		snapshot := GenerateBillingSnapshot(pricing, breakdown, nil, internalSettlement, nil)
-		snapshot.RequestMeta.RequestedModel = modelName
-		result.BillingSnapshot = SnapshotToJSON(snapshot)
-		result.BillingSummary = GenerateBillingSummary(ctx, snapshot)
-		result.BillingMode = pricing.BillingMode
-		result.BillingSource = pricing.BillingSource
-		result.RateMultiplier = pricing.DiscountRatio
-	}
+	attachTaskSnapshot(ctx, result, pricing, breakdown, modelName)
 
 	return result, nil
 }
 
+// attachTaskSnapshot 为任务结算结果补充快照/摘要/计费元数据。
+// 正常结算与幂等重放（DuplicateSkip）共用：重放路径可能触发用量日志补写，
+// 两类结果携带的计费信息必须同源，否则补写的日志与首写的口径分叉。
+// pricing 为 nil（取价失败）时不附加，调用方已留痕
+func attachTaskSnapshot(ctx context.Context, result *common.SettlementResult, pricing *PricingResult, breakdown *CostBreakdown, modelName string) {
+	if pricing == nil {
+		return
+	}
+	internalSettlement := &SettlementResult{
+		PreDeductAmount:  result.PreDeductAmount,
+		ActualCost:       result.ActualCost,
+		BaseCost:         breakdown.BaseCost,
+		RefundAmount:     result.RefundAmount,
+		SupplementAmount: result.SupplementAmount,
+	}
+	snapshot := GenerateBillingSnapshot(pricing, breakdown, nil, internalSettlement, nil)
+	snapshot.RequestMeta.RequestedModel = modelName
+	result.BillingSnapshot = SnapshotToJSON(snapshot)
+	result.BillingSummary = GenerateBillingSummary(ctx, snapshot)
+	result.BillingMode = pricing.BillingMode
+	result.BillingSource = pricing.BillingSource
+	result.RateMultiplier = pricing.DiscountRatio
+}
+
+// TaskBillingFacts 任务计费要素明细（仅任务结算路径填充，供快照解释费用构成；
+// 同步对话路径不经过 ratios/素材计量，恒为零值）
+type TaskBillingFacts struct {
+	// AppliedRatios 计费上下文中实际参与乘法的附加乘数（video_input 折扣、kling quality、
+	// param_multiplier 等），与 applyRatioMultipliers 同一过滤口径。
+	// 缺失该记录时「数量 × 单价 × 租户/时段倍率 = 费用」的算式在附加乘数 ≠ 1 时无法复算
+	AppliedRatios map[string]float64 `json:"applied_ratios,omitempty"`
+	// ParamMatched 参数倍率命中的规则说明（param_matched，| 分隔），解释 param_multiplier 来源
+	ParamMatched string `json:"param_matched,omitempty"`
+	// PerSecond 按秒/方案计费的命中明细（实际计费秒数、命中档位与单价）；
+	// 非 per_second/special 模式或按秒矩阵未参与定价时为 nil
+	PerSecond *PerSecondFacts `json:"per_second,omitempty"`
+}
+
+// PerSecondFacts 按秒计费命中明细：官方素材计量优先，回退提交时事实值（见 resolvePerSecondFacts）
+type PerSecondFacts struct {
+	Resolution string  // 命中的矩阵键（如 "720P"；空 = 矩阵未按档位配置，走通配/最低价兜底）
+	Seconds    float64 // 计费秒数
+	UnitPrice  float64 // 命中的每秒单价（本位币）
+}
+
+// collectTaskBillingFacts 从计费上下文与素材计量提取任务计费要素：
+// 附加乘数按 wrapSchemeCost / RecalculateByTokens 的同一过滤口径提取（跳过 duration/resolution——
+// 时长已体现在秒数/token 中，resolution 为乘数语义的存量键；spec.* 为事实值非乘数），
+// 按秒命中明细仅在按秒矩阵参与定价（查价 > 0）时记录，避免对非按秒计价的任务误导
+func collectTaskBillingFacts(pricing *PricingResult, ratios map[string]any, usage *common.TaskMaterialUsage) *TaskBillingFacts {
+	facts := &TaskBillingFacts{
+		AppliedRatios: appliedRatioMultipliers(ratios, "duration", "resolution"),
+	}
+	if pm, ok := ratioString(ratios, ratioKeyParamMatched); ok {
+		facts.ParamMatched = pm
+	}
+	if pricing != nil && (pricing.BillingMode == "per_second" || pricing.BillingMode == BillingModeSpecial) {
+		spec, seconds := resolvePerSecondFacts(ratios, usage)
+		if price := LookupPerSecondPrice(pricing.PerSecondPrices, spec); price > 0 {
+			facts.PerSecond = &PerSecondFacts{Resolution: spec, Seconds: seconds, UnitPrice: price}
+		}
+	}
+	if facts.AppliedRatios == nil && facts.ParamMatched == "" && facts.PerSecond == nil {
+		return nil
+	}
+	return facts
+}
+
+// appliedRatioMultipliers 提取计费上下文中实际参与乘法的附加乘数：float 且 > 0，
+// 跳过 spec.*（事实值）、显式 skip 键（duration/resolution 等）。与 applyRatioMultipliers
+// 的过滤逻辑保持一致——快照列出的必须是实际乘过的乘数，否则复算算式两边不相等
+func appliedRatioMultipliers(ratios map[string]any, skip ...string) map[string]float64 {
+	if len(ratios) == 0 {
+		return nil
+	}
+	var out map[string]float64
+	for k, v := range ratios {
+		if strings.HasPrefix(k, "spec.") {
+			continue
+		}
+		f, ok := v.(float64)
+		if !ok || f <= 0 {
+			continue
+		}
+		skipped := false
+		for _, s := range skip {
+			if k == s {
+				skipped = true
+				break
+			}
+		}
+		if skipped {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]float64)
+		}
+		out[k] = f
+	}
+	return out
+}
+
 // buildTaskCostBreakdown 构建任务计费的 CostBreakdown
-func buildTaskCostBreakdown(ctx context.Context, pricing *PricingResult, actualCost float64, totalTokens, _ int) *CostBreakdown {
+func buildTaskCostBreakdown(ctx context.Context, pricing *PricingResult, actualCost float64, totalTokens, _ int, ratios map[string]any, usage *common.TaskMaterialUsage) *CostBreakdown {
 	if pricing == nil {
 		return &CostBreakdown{
 			TotalCost: actualCost,
@@ -342,6 +443,7 @@ func buildTaskCostBreakdown(ctx context.Context, pricing *PricingResult, actualC
 		DiscountRatio:    pricing.DiscountRatio,
 		TenantMultiplier: pricing.TenantMultiplier,
 		Currency:         pricing.Currency,
+		TaskFacts:        collectTaskBillingFacts(pricing, ratios, usage),
 	}
 
 	if pricing.BillingMode == "per_request" {
@@ -460,6 +562,9 @@ func (b *TaskBillingProviderImpl) RecalculateByTokens(ctx context.Context, tenan
 
 	pricing, err := GetModelPriceAt(ctx, tenantID, modelName, billAt)
 	if err != nil {
+		// 取价失败回落预扣口径（多退少补兜底），留痕供对账排查——
+		// 静默吞错会让「预扣即终价」的任务无从解释
+		g.Log().Errorf(ctx, "recalculate by tokens: get price failed, tenant=%d model=%s: %v (fallback to pre-deduct)", tenantID, modelName, err)
 		return Zero, nil
 	}
 

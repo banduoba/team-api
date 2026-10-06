@@ -33,8 +33,10 @@ type TaskBillingProvider interface {
 	CheckApiKeyQuota(ctx context.Context, apiKeyID int64, preDeductAmount decimal.Decimal) error
 
 	// SettleTaskSuccess 任务成功结算（含计费快照）。billAt 为任务受理时刻（时段定价按该时刻评估，
-	// 异步任务结算滞后数分钟~小时，按结算时刻会丢失受理时的时段价）
-	SettleTaskSuccess(ctx context.Context, tenantID, userID, apiKeyID, channelID int64, modelName, requestID string, actualCost, preDeductAmount decimal.Decimal, totalTokens, completionTokens int, ratios map[string]any, taskID string, billAt time.Time) (*SettlementResult, error)
+	// 异步任务结算滞后数分钟~小时，按结算时刻会丢失受理时的时段价）。
+	// usage 为上游返回的素材计量（实际输出秒数/分辨率等，nil = 上游未提供）：
+	// 快照按秒命中明细（计费秒数/档位）以官方计量优先，缺失回退提交时事实值
+	SettleTaskSuccess(ctx context.Context, tenantID, userID, apiKeyID, channelID int64, modelName, requestID string, actualCost, preDeductAmount decimal.Decimal, totalTokens, completionTokens int, usage *TaskMaterialUsage, ratios map[string]any, taskID string, billAt time.Time) (*SettlementResult, error)
 
 	// SettleTaskFailed 任务失败退还预扣
 	SettleTaskFailed(ctx context.Context, tenantID int64, requestID string, preDeductAmount decimal.Decimal) error

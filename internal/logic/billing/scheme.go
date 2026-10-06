@@ -110,6 +110,31 @@ func (GenericScheme) ValidateSchemeConfig(cfg json.RawMessage) error {
 	return nil
 }
 
+// resolvePerSecondFacts 解析按秒计费的结算要素：计费秒数 + 查价档位。
+// 秒数优先官方素材计量（usage.OutputSeconds，钳制 maxTaskDurationSeconds 防异常大值刷扣），
+// 回退提交时请求时长（spec.duration，同样钳制），再回退默认时长；
+// 档位优先 usage.Resolution（实际输出分辨率，仅在与官方秒数同一分支内生效，
+// 与 SettleTaskCost 的查价口径一致），回退 spec.resolution（提交时请求档位）。
+// 预扣估算（usage=nil）、结算重算与计费快照共用本解析器，保证各时点查价口径一致。
+func resolvePerSecondFacts(ratios map[string]any, usage *rcommon.TaskMaterialUsage) (spec string, seconds float64) {
+	spec, _ = ratioString(ratios, "spec.resolution")
+	if usage != nil && usage.OutputSeconds > 0 {
+		seconds = usage.OutputSeconds
+		if usage.Resolution != "" {
+			spec = usage.Resolution
+		}
+	} else {
+		seconds = defaultTaskDurationSeconds
+		if d, ok := ratioFloat(ratios, "spec.duration"); ok && d > 0 {
+			seconds = d
+		}
+	}
+	if seconds > maxTaskDurationSeconds {
+		seconds = maxTaskDurationSeconds
+	}
+	return spec, seconds
+}
+
 // SettleTaskCost 通用引擎的结算口径：
 //   - per_second（按秒计费）：上游返回实际输出秒数（usage.OutputSeconds > 0）时按
 //     「实际秒数 × 矩阵单价 × 租户乘数 × 时段乘数」结算，多退少补——查价键优先
@@ -120,18 +145,10 @@ func (GenericScheme) ValidateSchemeConfig(cfg json.RawMessage) error {
 //     （与 estimateTaskCost 的估算公式一致，结算保持「预扣即终价，token 重算另走 RecalculateByTokens」）。
 func (g GenericScheme) SettleTaskCost(pricing *PricingResult, ratios map[string]any, usage *rcommon.TaskMaterialUsage) decimal.Decimal {
 	if pricing.BillingMode == "per_second" && usage != nil && usage.OutputSeconds > 0 {
-		duration := usage.OutputSeconds
-		// 结算秒数钳制上限与预扣一致，防御异常大值刷扣
-		if duration > maxTaskDurationSeconds {
-			duration = maxTaskDurationSeconds
-		}
-		spec, _ := ratioString(ratios, "spec.resolution")
-		if usage.Resolution != "" {
-			spec = usage.Resolution
-		}
+		spec, seconds := resolvePerSecondFacts(ratios, usage)
 		if price := LookupPerSecondPrice(pricing.PerSecondPrices, spec); price > 0 {
 			return NewFromFloat(price).
-				Mul(NewFromFloat(duration)).
+				Mul(NewFromFloat(seconds)).
 				Mul(NewFromFloat(pricing.TenantMultiplier)).
 				Mul(NewFromFloat(effectiveTimeMultiplier(pricing)))
 		}
@@ -168,16 +185,9 @@ func (GenericScheme) EstimateTaskCost(pricing *PricingResult, ratios map[string]
 	var costD decimal.Decimal
 	switch {
 	case pricing.BillingMode == "per_second":
-		// 按秒计费：矩阵查价 × 时长 × 租户乘数 × 时段乘数
-		duration := defaultTaskDurationSeconds
-		if d, ok := ratioFloat(ratios, "spec.duration"); ok && d > 0 {
-			duration = d
-		}
-		// 时长来自用户请求，钳制上限防天价预扣（正常视频模型远低于该上限）
-		if duration > maxTaskDurationSeconds {
-			duration = maxTaskDurationSeconds
-		}
-		spec, _ := ratioString(ratios, "spec.resolution")
+		// 按秒计费：矩阵查价 × 时长 × 租户乘数 × 时段乘数。
+		// 要素解析（时长钳制/档位回退）与结算、快照共用 resolvePerSecondFacts，预扣传 usage=nil
+		spec, duration := resolvePerSecondFacts(ratios, nil)
 		price := LookupPerSecondPrice(pricing.PerSecondPrices, spec)
 		if price <= 0 {
 			// 矩阵全零/为空：按未配价占位预扣，结算多退少补

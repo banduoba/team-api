@@ -642,15 +642,19 @@ func settleSyncImageSuccess(ctx context.Context, job *SyncImageJob, sel *common.
 	}
 
 	// 2. 结算钱包（传真实 token 用量：驱动 bil_records.output_tokens 与计费快照的 token 明细；
-	// billAt=提交时刻，时段定价按受理时刻计价）
+	// billAt=提交时刻，时段定价按受理时刻计价。图片任务无素材计量，usage 传 nil）。
+	// 用量日志写入原则与 pollSingleTask 一致：结算成功且 billing_settled 落库成功才写，
+	// 否则延后到 handleUnsettledSyncImage 重试结算成功后补写（防金额漂移/双条记录）
 	settleResult, serr := syncImageBilling.SettleTaskSuccess(ctx, job.TenantID, job.UserID, job.ApiKeyID, sel.ChannelID,
-		job.Model, job.RequestID, actualCost, job.PreDeductAmount, totalTokens, completionTokens, job.Ratios, job.PublicTaskID, job.SubmitTime)
+		job.Model, job.RequestID, actualCost, job.PreDeductAmount, totalTokens, completionTokens, nil, job.Ratios, job.PublicTaskID, job.SubmitTime)
+	usageLogDeferred := false
 	if serr != nil {
 		// 保留 billing_settled=false，由未结算兜底网重放结算
 		g.Log().Warningf(ctx, "sync_image: task %s settle success failed (unsettled net will retry): %v", job.PublicTaskID, serr)
+		usageLogDeferred = true
 	} else {
 		// 3. 标记已结算
-		_ = DefaultAsyncProvider.UpdateTask(ctx, &common.AsyncTask{
+		if uErr := DefaultAsyncProvider.UpdateTask(ctx, &common.AsyncTask{
 			ID:             job.TaskID,
 			Status:         "SUCCESS",
 			Progress:       "100%",
@@ -659,8 +663,12 @@ func settleSyncImageSuccess(ctx context.Context, job *SyncImageJob, sel *common.
 			FinishTime:     &now,
 			BillingSettled: true,
 			ActualCost:     actualCost,
-		})
-		// 幂等重复结算（DuplicateSkip）不得重复累加 Key 额度
+		}); uErr != nil {
+			// settled 未落库：重试网按 DuplicateSkip 重放并补写用量日志，此处写会双条
+			g.Log().Warningf(ctx, "sync_image: task %s persist settled failed, defer usage log: %v", job.PublicTaskID, uErr)
+			usageLogDeferred = true
+		}
+		// 幂等重复结算（DuplicateSkip）不得重复累加 Key 额度（额度随扣款累计，与落库结果解耦）
 		if settleResult == nil || !settleResult.DuplicateSkip {
 			syncImageBilling.IncrApiKeyQuotaUsed(ctx, job.ApiKeyID, actualCost)
 		}
@@ -676,9 +684,11 @@ func settleSyncImageSuccess(ctx context.Context, job *SyncImageJob, sel *common.
 	usageTask.PromptTokens = promptTokens
 	usageTask.CompletionTokens = completionTokens
 	usageTask.TotalTokens = totalTokens
-	recordTaskUsage(usageTask, chBasic, true, "", settleResult)
-	// 闭环审计：把提交阶段写入的 SUBMITTED 审计记录更新为终态（与 pollSingleTask 一致），
-	// 否则请求审计日志里的任务状态会一直停留在「已提交」。
+	if !usageLogDeferred {
+		recordTaskUsage(usageTask, chBasic, true, "", settleResult)
+	}
+	// 闭环审计：把提交阶段写入的 SUBMITTED 审计记录更新为终态（与 pollSingleTask 一致，
+	// 任务终态与计费解耦，始终立即落），否则审计里的任务状态会一直停留在「已提交」。
 	recordTaskCompletionAudit(usageTask, "SUCCESS", string(normalized), nil)
 }
 

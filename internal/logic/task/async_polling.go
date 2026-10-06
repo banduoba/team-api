@@ -212,15 +212,16 @@ func handleUnsettledTasks(ctx context.Context) {
 		}
 
 		if t.Status == "SUCCESS" {
-			// 成功任务：用 ActualCost（已在上次轮询中计算）结算
+			// 成功任务：用 ActualCost（结算失败窗口已随本函数重试前持久化）结算
 			actualCost := t.ActualCost
 			if actualCost.LessThanOrEqual(billing.Zero) {
 				actualCost = t.PreDeductAmount
 			}
 			taskBilling := billing.NewTaskBillingProvider()
+			// token 用量取任务行持久化值（终态转移时已保存），驱动 bil_records 与快照 token 明细
 			settleResult, err := taskBilling.SettleTaskSuccess(ctx, t.TenantID, t.UserID, t.ApiKeyID, t.ChannelID,
 				t.ModelName, t.RequestID, actualCost, t.PreDeductAmount,
-				0, 0, pd.BillingContext.Ratios, t.PublicTaskID, t.CreatedAt)
+				t.TotalTokens, t.CompletionTokens, nil, pd.BillingContext.Ratios, t.PublicTaskID, t.CreatedAt)
 			if err != nil {
 				g.Log().Warningf(ctx, "poll: retry settle task %s: %v", t.PublicTaskID, err)
 			} else {
@@ -230,7 +231,17 @@ func handleUnsettledTasks(ctx context.Context) {
 				if settleResult == nil || !settleResult.DuplicateSkip {
 					taskBilling.IncrApiKeyQuotaUsed(ctx, t.ApiKeyID, actualCost)
 				}
-				DefaultAsyncProvider.UpdateTask(ctx, t)
+				if uErr := DefaultAsyncProvider.UpdateTask(ctx, t); uErr != nil {
+					g.Log().Warningf(ctx, "poll: persist retried settlement for task %s failed: %v", t.PublicTaskID, uErr)
+				} else {
+					// 补写用量日志：结算失败窗口（pollSingleTask 延后）与崩溃窗口在此落请求侧真相。
+					// settled 落库成功才写——与 pollSingleTask 的写入原则闭环，每请求至多一条
+					var ch *common.ChannelBasicInfo
+					if t.ChannelID > 0 {
+						ch, _ = DefaultAsyncProvider.GetChannelByID(ctx, t.ChannelID)
+					}
+					recordTaskUsage(t, ch, true, "", settleResult)
+				}
 				g.Log().Infof(ctx, "poll: retried settlement for task %s", t.PublicTaskID)
 			}
 		} else {
@@ -264,7 +275,8 @@ func handleUnsettledSyncImage(ctx context.Context, t *common.AsyncTask) {
 			actualCost = t.PreDeductAmount
 		}
 		settleResult, err := taskBilling.SettleTaskSuccess(ctx, t.TenantID, t.UserID, t.ApiKeyID, t.ChannelID,
-			t.ModelName, t.RequestID, actualCost, t.PreDeductAmount, 0, 0, pd.BillingContext.Ratios, t.PublicTaskID, t.CreatedAt)
+			t.ModelName, t.RequestID, actualCost, t.PreDeductAmount,
+			t.TotalTokens, t.CompletionTokens, nil, pd.BillingContext.Ratios, t.PublicTaskID, t.CreatedAt)
 		if err != nil {
 			g.Log().Warningf(ctx, "poll: retry settle sync_image task %s: %v", t.PublicTaskID, err)
 			return
@@ -275,7 +287,16 @@ func handleUnsettledSyncImage(ctx context.Context, t *common.AsyncTask) {
 		if settleResult == nil || !settleResult.DuplicateSkip {
 			taskBilling.IncrApiKeyQuotaUsed(ctx, t.ApiKeyID, actualCost)
 		}
-		DefaultAsyncProvider.UpdateTask(ctx, t)
+		if uErr := DefaultAsyncProvider.UpdateTask(ctx, t); uErr != nil {
+			g.Log().Warningf(ctx, "poll: persist retried settlement for sync_image task %s failed: %v", t.PublicTaskID, uErr)
+		} else {
+			// 补写用量日志（与 handleUnsettledTasks 的写入原则一致：settled 落库成功才写）
+			var ch *common.ChannelBasicInfo
+			if t.ChannelID > 0 {
+				ch, _ = DefaultAsyncProvider.GetChannelByID(ctx, t.ChannelID)
+			}
+			recordTaskUsage(t, ch, true, "", settleResult)
+		}
 		g.Log().Infof(ctx, "poll: retried settlement for sync_image task %s", t.PublicTaskID)
 		return
 	}
@@ -452,8 +473,11 @@ func pollSingleTask(ctx context.Context, adaptor common.TaskAdaptor, channel *co
 		task.ResultURL = taskInfo.ResultURL
 		DefaultAsyncProvider.UpdateTask(ctx, task) // 更新 result_url
 
-		// 结算计费
+		// 结算计费。用量日志写入原则：结算成功且 billing_settled 已落库才写——
+		// 结算失败/落库失败时延后到 handleUnsettledTasks 重试结算成功后补写，
+		// 防止「日志记重算额、钱包按预扣兜底扣」的金额漂移，或同请求出现两条用量记录
 		var settleResult *common.SettlementResult
+		usageLogDeferred := false
 		if task.PreDeductAmount.GreaterThan(billing.Zero) && !task.BillingSettled {
 			taskBilling := billing.NewTaskBillingProvider()
 			actualCost := task.PreDeductAmount
@@ -477,25 +501,39 @@ func pollSingleTask(ctx context.Context, adaptor common.TaskAdaptor, channel *co
 			}
 
 			task.ActualCost = actualCost
-			settleResult, err = taskBilling.SettleTaskSuccess(ctx, task.TenantID, task.UserID, task.ApiKeyID, task.ChannelID, task.ModelName, task.RequestID, actualCost, task.PreDeductAmount, taskInfo.TotalTokens, taskInfo.CompletionTokens, pd.BillingContext.Ratios, task.PublicTaskID, task.CreatedAt)
+			settleResult, err = taskBilling.SettleTaskSuccess(ctx, task.TenantID, task.UserID, task.ApiKeyID, task.ChannelID, task.ModelName, task.RequestID, actualCost, task.PreDeductAmount, taskInfo.TotalTokens, taskInfo.CompletionTokens, taskInfo.MaterialUsage, pd.BillingContext.Ratios, task.PublicTaskID, task.CreatedAt)
 			if err != nil {
-				g.Log().Warningf(ctx, "poll: settle task %s: %v", task.PublicTaskID, err)
+				// 结算失败（Redis/DB 抖动等）：先持久化重算出的实际费用，重试结算按同金额扣款，
+				// 避免「预扣兜底扣款 ≠ 重算金额」；用量日志延后补写
+				g.Log().Warningf(ctx, "poll: settle task %s: %v (usage log deferred to settle retry)", task.PublicTaskID, err)
+				usageLogDeferred = true
+				if uErr := DefaultAsyncProvider.UpdateTask(ctx, task); uErr != nil {
+					g.Log().Warningf(ctx, "poll: persist actual cost for task %s failed: %v", task.PublicTaskID, uErr)
+				}
 			} else {
 				task.BillingSettled = true
-				// 幂等重复结算（DuplicateSkip）不得重复累加 Key 额度
+				// 幂等重复结算（DuplicateSkip）不得重复累加 Key 额度。
+				// 额度随扣款累计（与落库结果解耦）：settled 落库失败时重试按 DuplicateSkip 跳过，恰好一次
 				if settleResult == nil || !settleResult.DuplicateSkip {
 					taskBilling.IncrApiKeyQuotaUsed(ctx, task.ApiKeyID, actualCost)
 				}
-				DefaultAsyncProvider.UpdateTask(ctx, task)
+				if uErr := DefaultAsyncProvider.UpdateTask(ctx, task); uErr != nil {
+					// billing_settled 未落库：重试网会以 DuplicateSkip 重放结算并补写用量日志，
+					// 此刻写日志会造成同请求两条用量记录
+					g.Log().Warningf(ctx, "poll: persist settled task %s failed, defer usage log: %v", task.PublicTaskID, uErr)
+					usageLogDeferred = true
+				}
 			}
 			billing.CleanupPreDeduct(ctx, task.TenantID, task.RequestID+"_adjust")
 		}
 		g.Log().Infof(ctx, "poll: task %s completed", task.PublicTaskID)
 
-		// 记录用量日志
-		recordTaskUsage(task, channel, true, "", settleResult)
+		// 记录用量日志（结算已确认或本就无需结算时；延后的由重试网补写）
+		if !usageLogDeferred {
+			recordTaskUsage(task, channel, true, "", settleResult)
+		}
 
-		// 更新审计记录
+		// 更新审计记录（任务终态与计费解耦，始终立即落）
 		recordTaskCompletionAudit(task, "SUCCESS", string(body), upstreamRespHeaders(resp))
 
 	} else if taskInfo.Status == common.TaskStatusFailure {
@@ -522,6 +560,18 @@ func pollSingleTask(ctx context.Context, adaptor common.TaskAdaptor, channel *co
 
 // recordTaskUsage 异步记录视频/音乐等异步任务的用量日志
 func recordTaskUsage(task *common.AsyncTask, channel *common.ChannelBasicInfo, success bool, errMsg string, settleResult *common.SettlementResult) {
+	relay.NewDataProvider().RecordUsage(context.Background(),
+		buildTaskUsageRecord(task, channel, success, errMsg, settleResult))
+}
+
+// buildTaskUsageRecord 构造异步任务的用量记录（纯函数，便于单测）。
+// 费用列口径与同步链路（relay_handler）严格一致：
+//   - total_cost  = BaseCost，折扣前基础费用（租户/时段/附加乘数前）；
+//   - actual_cost = ActualCost，折扣后实际扣款。
+//
+// 此前任务路径把 actual 同时写进两列，与同步路径的 BaseCost 语义分叉，
+// 折扣租户下 SUM(total_cost) 类趋势统计（同步行折前、任务行折后）口径混杂。
+func buildTaskUsageRecord(task *common.AsyncTask, channel *common.ChannelBasicInfo, success bool, errMsg string, settleResult *common.SettlementResult) *common.UsageRecord {
 	latencyMs := 0
 	if task.SubmitTime != nil && task.FinishTime != nil {
 		latencyMs = int(task.FinishTime.Sub(*task.SubmitTime).Milliseconds())
@@ -610,18 +660,31 @@ func recordTaskUsage(task *common.AsyncTask, channel *common.ChannelBasicInfo, s
 		record.RefundAmount = settleResult.RefundAmount
 		record.SupplementAmount = settleResult.SupplementAmount
 		record.Currency = billing.Currency(context.Background())
+		// total_cost 与同步链路对齐写折扣前基础费用（此前误写 actual，
+		// 与 relay_handler 的 BaseCost 口径分叉，见函数头注释）
+		record.TotalCost = settleResult.BaseCost
 	} else {
-		// 失败/超时任务：从定价中获取计费模式
-		billingMode := "per_request"
-		if pricing, err := billing.GetModelPrice(context.Background(), task.TenantID, task.ModelName); err == nil {
-			if pricing.BillingMode != "" {
-				billingMode = pricing.BillingMode
-			}
-		}
-		record.BillingMode = billingMode
+		// 失败/超时任务：从定价中获取计费模式（仅展示用，取价失败回退 per_request）
+		record.BillingMode = failedTaskBillingMode(context.Background(), task.TenantID, task.ModelName)
 	}
 
-	relay.NewDataProvider().RecordUsage(context.Background(), record)
+	return record
+}
+
+// failedTaskBillingMode 失败/超时任务的计费模式（仅用于用量日志展示）。
+// 配置基础设施不可用（如单测环境无 DB 驱动，g.DB() 直接 panic）时回退 per_request，
+// 与 billing.Currency 的单测兜底惯例一致，保证 buildTaskUsageRecord 纯函数可测
+func failedTaskBillingMode(ctx context.Context, tenantID int64, modelName string) (mode string) {
+	mode = "per_request"
+	defer func() {
+		if r := recover(); r != nil {
+			// 保持默认值（per_request）
+		}
+	}()
+	if pricing, err := billing.GetModelPrice(ctx, tenantID, modelName); err == nil && pricing.BillingMode != "" {
+		mode = pricing.BillingMode
+	}
+	return mode
 }
 
 // recordTaskCompletionAudit 更新提交阶段写入的审计记录，补充异步任务最终结果

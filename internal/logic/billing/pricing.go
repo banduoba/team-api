@@ -689,6 +689,10 @@ type CostBreakdown struct {
 	CacheReadTokens     int
 	CacheCreationCost   float64
 	CacheReadCost       float64
+
+	// TaskFacts 任务计费要素明细（仅任务结算路径填充：附加乘数清单、参数倍率命中、
+	// 按秒命中明细），随快照留痕供账单复算；同步对话路径恒为 nil
+	TaskFacts *TaskBillingFacts
 }
 
 // EstimatePreDeductAmount 估算预扣金额
