@@ -581,9 +581,10 @@ func (s *sAdmin) GetUsageLogSummary(ctx context.Context, req *v1.AdminUsageLogSu
 	where, args := buildUsageLogFilter(req.AdminUsageLogFilter)
 
 	// 统计聚合不展示名称，筛选条件也只引用 u.*，全程无需联表：
-	// 大表 SUM 不再背负任何 join。
+	// 大表 SUM 不再背负任何 join。费用列实扣优先（actual_cost，0/NULL 回退
+	// total_cost），与租户端同名汇总（UsageLogsSummary）口径一致
 	summarySQL := `SELECT
-		COALESCE(SUM(u.total_cost), 0) AS total_cost,
+		COALESCE(SUM(COALESCE(NULLIF(u.actual_cost, 0), u.total_cost)), 0) AS total_cost,
 		COALESCE(SUM(u.output_tokens), 0) AS total_output_tokens,
 		COALESCE(SUM(u.input_tokens), 0) AS total_input_tokens,
 		COALESCE(SUM(u.cache_read_tokens), 0) AS total_cache_read

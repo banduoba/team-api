@@ -120,11 +120,13 @@ func (s *sTenant) Dashboard(ctx context.Context, req *v1.TenantDashboardReq) (*v
 		FailedRequests  int64   `json:"failed_requests"`
 		RetriedRequests int64   `json:"retried_requests"`
 	}
+	// 费用列实扣优先（actual_cost，0/NULL 回退 total_cost），与上面「今日/本月统计」同口径——
+	// 同屏的环比基数与本月消费口径一致，折扣租户的百分比才有意义
 	err = g.DB().Ctx(ctx).Raw(`
 		SELECT
-			COALESCE(SUM(CASE WHEN created_at >= ? THEN total_cost END), 0) AS cur_cost,
-			COALESCE(SUM(CASE WHEN created_at >= ? AND created_at < ? THEN total_cost END), 0) AS prev_cost,
-			COALESCE(SUM(CASE WHEN created_at >= ? AND status <> 'success' THEN total_cost END), 0) AS wasted_cost,
+			COALESCE(SUM(CASE WHEN created_at >= ? THEN COALESCE(NULLIF(actual_cost, 0), total_cost) END), 0) AS cur_cost,
+			COALESCE(SUM(CASE WHEN created_at >= ? AND created_at < ? THEN COALESCE(NULLIF(actual_cost, 0), total_cost) END), 0) AS prev_cost,
+			COALESCE(SUM(CASE WHEN created_at >= ? AND status <> 'success' THEN COALESCE(NULLIF(actual_cost, 0), total_cost) END), 0) AS wasted_cost,
 			COUNT(*) FILTER (WHERE created_at >= ? AND status <> 'success') AS failed_requests,
 			COUNT(*) FILTER (WHERE created_at >= ? AND retry_index > 0) AS retried_requests
 		FROM bil_usage_logs
@@ -522,8 +524,8 @@ func (s *sTenant) GetMemberUsageRanking(ctx context.Context, req *v1.TenantMembe
 			COUNT(*) FILTER (WHERE ul.created_at >= ?) AS requests,
 			COALESCE(SUM(CASE WHEN ul.created_at >= ? THEN ul.input_tokens END), 0) AS input_tokens,
 			COALESCE(SUM(CASE WHEN ul.created_at >= ? THEN ul.output_tokens END), 0) AS output_tokens,
-			COALESCE(SUM(CASE WHEN ul.created_at >= ? THEN ul.total_cost END), 0) AS total_cost,
-			COALESCE(SUM(CASE WHEN ul.created_at < ? THEN ul.total_cost END), 0) AS prev_cost,
+			COALESCE(SUM(CASE WHEN ul.created_at >= ? THEN COALESCE(NULLIF(ul.actual_cost, 0), ul.total_cost) END), 0) AS total_cost,
+			COALESCE(SUM(CASE WHEN ul.created_at < ? THEN COALESCE(NULLIF(ul.actual_cost, 0), ul.total_cost) END), 0) AS prev_cost,
 			COALESCE(u.quota_limit, 0) AS quota_limit,
 			COALESCE(u.quota_used, 0) AS quota_used,
 			COALESCE(u.quota_type, 'none') AS quota_type

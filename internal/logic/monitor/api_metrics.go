@@ -910,7 +910,7 @@ func GetTenantRanking(ctx context.Context, minutes int) ([]map[string]any, error
 			t.id as tenant_id,
 			t.name as tenant_name,
 			COUNT(*) as requests,
-			COALESCE(SUM(ul.total_cost), 0) as total_cost
+			COALESCE(SUM(COALESCE(NULLIF(ul.actual_cost, 0), ul.total_cost)), 0) as total_cost
 		FROM bil_usage_logs ul
 		JOIN tnt_tenants t ON t.id = ul.tenant_id
 		WHERE ul.created_at >= ?

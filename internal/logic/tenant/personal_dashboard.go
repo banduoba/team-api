@@ -40,7 +40,7 @@ func (s *sTenant) PersonalDashboard(ctx context.Context, req *v1.PersonalDashboa
 			COUNT(CASE WHEN created_at >= ? THEN 1 END) as today_requests,
 			COALESCE(SUM(CASE WHEN created_at >= ? THEN input_tokens ELSE 0 END), 0) as today_input_tokens,
 			COALESCE(SUM(CASE WHEN created_at >= ? THEN output_tokens ELSE 0 END), 0) as today_output_tokens,
-			COALESCE(SUM(CASE WHEN created_at >= ? THEN total_cost ELSE 0 END), 0) as today_total_cost,
+			COALESCE(SUM(CASE WHEN created_at >= ? THEN COALESCE(NULLIF(actual_cost, 0), total_cost) ELSE 0 END), 0) as today_total_cost,
 			COUNT(*) as month_requests,
 			COALESCE(SUM(input_tokens), 0) as month_input_tokens,
 			COALESCE(SUM(output_tokens), 0) as month_output_tokens,
@@ -390,7 +390,7 @@ func (s *sTenant) PersonalApiKeyUsage(ctx context.Context, req *v1.PersonalApiKe
 			COUNT(*) as requests,
 			COALESCE(SUM(ul.input_tokens), 0) as input_tokens,
 			COALESCE(SUM(ul.output_tokens), 0) as output_tokens,
-			COALESCE(SUM(ul.total_cost), 0) as total_cost
+			COALESCE(SUM(COALESCE(NULLIF(ul.actual_cost, 0), ul.total_cost)), 0) as total_cost
 		FROM bil_usage_logs ul
 		LEFT JOIN api_keys k ON k.id = ul.api_key_id
 		WHERE ul.user_id = ? AND ul.tenant_id = ? AND ul.created_at >= ?
