@@ -146,6 +146,7 @@ const billingSourceLabel: Record<string, string> = {
 	tenant: '租户定价',
 	custom: '自定义',
 	plan: '套餐价',
+	// 历史值：2026-10 前失败/超时任务行曾写 "task"，现统一为定价来源语义；保留翻译供存量行展示，勿删
 	task: '异步任务',
 }
 

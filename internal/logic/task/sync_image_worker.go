@@ -257,21 +257,20 @@ func timeoutRunningSyncImageJob(ctx context.Context, job *SyncImageJob) bool {
 		return false // 已被 worker 收尾或其他方抢占
 	}
 
-	settled := true
+	// 退款成功且认领「已结算」标记后写失败行用量日志（与成功行同一原则，每请求至多一条）：
+	// 退款/认领失败延后到 handleUnsettledSyncImage 补写；零预扣任务不进重试网直接写。
+	// 终态字段已由上方 CAS 落库，标记只写最小字段集
+	usageLogDeferred := false
 	if job.PreDeductAmount.GreaterThan(billing.Zero) {
 		if err := syncImageBilling.SettleTaskFailed(ctx, job.TenantID, job.RequestID, job.PreDeductAmount); err != nil {
 			g.Log().Warningf(ctx, "sync_image: timeout task %s refund failed (unsettled net will retry): %v", job.PublicTaskID, err)
-			settled = false
+			usageLogDeferred = true
+		} else if claimed, mErr := DefaultAsyncProvider.MarkTaskSettled(ctx, &common.AsyncTask{ID: job.TaskID, ActualCost: billing.Zero}); mErr != nil {
+			g.Log().Warningf(ctx, "sync_image: timeout task %s mark refunded failed, defer usage log: %v", job.PublicTaskID, mErr)
+			usageLogDeferred = true
+		} else {
+			usageLogDeferred = !claimed
 		}
-	}
-	if settled {
-		_ = DefaultAsyncProvider.UpdateTask(ctx, &common.AsyncTask{
-			ID:             job.TaskID,
-			Status:         "FAILURE",
-			FailReason:     reason,
-			FinishTime:     &now,
-			BillingSettled: true,
-		})
 	}
 
 	syncImageFailed.Add(1)
@@ -279,8 +278,11 @@ func timeoutRunningSyncImageJob(ctx context.Context, job *SyncImageJob) bool {
 	monitor.UnregisterRequestByTaskID(job.PublicTaskID)
 
 	usageTask := buildUsageTask(job, nil, "FAILURE", billing.Zero, now)
-	recordTaskUsage(usageTask, nil, false, reason, nil)
-	// 闭环审计：把提交阶段的 SUBMITTED 审计记录更新为 TIMEOUT（与超时兜底网一致）。
+	if !usageLogDeferred {
+		recordTaskUsage(usageTask, nil, false, reason, nil)
+	}
+	// 闭环审计：把提交阶段的 SUBMITTED 审计记录更新为 TIMEOUT（与超时兜底网一致，
+	// 任务终态与计费解耦，始终立即落）。
 	recordTaskCompletionAudit(usageTask, "TIMEOUT", reason, nil)
 	return true
 }
@@ -365,21 +367,19 @@ func failQueuedSyncImageJob(ctx context.Context, job *SyncImageJob, reason strin
 		return
 	}
 
-	settled := true
+	// 退款成功且认领「已结算」标记后写失败行用量日志（与 timeoutRunningSyncImageJob 同一
+	// 原则）：退款/认领失败延后到 handleUnsettledSyncImage 补写；零预扣任务不进重试网直接写
+	usageLogDeferred := false
 	if job.PreDeductAmount.GreaterThan(billing.Zero) {
 		if err := syncImageBilling.SettleTaskFailed(ctx, job.TenantID, job.RequestID, job.PreDeductAmount); err != nil {
 			g.Log().Warningf(ctx, "sync_image: shutdown-fail task %s refund failed (unsettled net will retry): %v", job.PublicTaskID, err)
-			settled = false
+			usageLogDeferred = true
+		} else if claimed, mErr := DefaultAsyncProvider.MarkTaskSettled(ctx, &common.AsyncTask{ID: job.TaskID, ActualCost: billing.Zero}); mErr != nil {
+			g.Log().Warningf(ctx, "sync_image: shutdown-fail task %s mark refunded failed, defer usage log: %v", job.PublicTaskID, mErr)
+			usageLogDeferred = true
+		} else {
+			usageLogDeferred = !claimed
 		}
-	}
-	if settled {
-		_ = DefaultAsyncProvider.UpdateTask(ctx, &common.AsyncTask{
-			ID:             job.TaskID,
-			Status:         "FAILURE",
-			FailReason:     reason,
-			FinishTime:     &now,
-			BillingSettled: true,
-		})
 	}
 
 	syncImageFailed.Add(1)
@@ -387,8 +387,10 @@ func failQueuedSyncImageJob(ctx context.Context, job *SyncImageJob, reason strin
 	monitor.UnregisterRequestByTaskID(job.PublicTaskID)
 
 	usageTask := buildUsageTask(job, nil, "FAILURE", billing.Zero, now)
-	recordTaskUsage(usageTask, nil, false, reason, nil)
-	// 闭环审计：把提交阶段的 SUBMITTED 审计记录更新为 FAILURE。
+	if !usageLogDeferred {
+		recordTaskUsage(usageTask, nil, false, reason, nil)
+	}
+	// 闭环审计：把提交阶段的 SUBMITTED 审计记录更新为 FAILURE（任务终态与计费解耦，始终立即落）。
 	recordTaskCompletionAudit(usageTask, "FAILURE", reason, nil)
 }
 
@@ -724,21 +726,19 @@ func failSyncImageJob(ctx context.Context, job *SyncImageJob, sel *common.Channe
 		return
 	}
 
-	settled := true
+	// 退款成功且认领「已结算」标记后写失败行用量日志（与成功行同一原则，每请求至多一条）：
+	// 退款/认领失败延后到 handleUnsettledSyncImage 补写；零预扣任务不进重试网直接写
+	usageLogDeferred := false
 	if job.PreDeductAmount.GreaterThan(billing.Zero) {
 		if err := syncImageBilling.SettleTaskFailed(ctx, job.TenantID, job.RequestID, job.PreDeductAmount); err != nil {
 			g.Log().Warningf(ctx, "sync_image: task %s refund failed (unsettled net will retry): %v", job.PublicTaskID, err)
-			settled = false
+			usageLogDeferred = true
+		} else if claimed, mErr := DefaultAsyncProvider.MarkTaskSettled(ctx, &common.AsyncTask{ID: job.TaskID, ActualCost: billing.Zero}); mErr != nil {
+			g.Log().Warningf(ctx, "sync_image: task %s mark refunded failed, defer usage log: %v", job.PublicTaskID, mErr)
+			usageLogDeferred = true
+		} else {
+			usageLogDeferred = !claimed
 		}
-	}
-	if settled {
-		_ = DefaultAsyncProvider.UpdateTask(ctx, &common.AsyncTask{
-			ID:             job.TaskID,
-			Status:         "FAILURE",
-			FailReason:     reason,
-			FinishTime:     &now,
-			BillingSettled: true,
-		})
 	}
 
 	syncImageFailed.Add(1)
@@ -750,8 +750,10 @@ func failSyncImageJob(ctx context.Context, job *SyncImageJob, sel *common.Channe
 		chBasic = &common.ChannelBasicInfo{ID: sel.ChannelID, Type: sel.ChannelType, Name: sel.ChannelName}
 	}
 	usageTask := buildUsageTask(job, sel, "FAILURE", billing.Zero, now)
-	recordTaskUsage(usageTask, chBasic, false, reason, nil)
-	// 闭环审计：更新提交阶段的 SUBMITTED 审计记录为 FAILURE。
+	if !usageLogDeferred {
+		recordTaskUsage(usageTask, chBasic, false, reason, nil)
+	}
+	// 闭环审计：更新提交阶段的 SUBMITTED 审计记录为 FAILURE（任务终态与计费解耦，始终立即落）。
 	recordTaskCompletionAudit(usageTask, "FAILURE", reason, nil)
 }
 

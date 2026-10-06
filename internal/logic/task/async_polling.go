@@ -158,22 +158,39 @@ func handleTimedOutTasks(ctx context.Context) {
 		DecrActiveTask()
 		monitor.UnregisterRequestByTaskID(t.PublicTaskID)
 
-		// 退还预扣费用
+		// 退还预扣费用。失败行用量日志与成功行同一原则：退款成功且认领「已结算」标记后写
+		// （此前不落 billing_settled，重试网会再入同一任务）——退款/认领失败延后到
+		// handleUnsettledTasks 补写，每请求至多一条；零预扣任务不进重试网，直接写
+		usageLogDeferred := false
 		if t.PreDeductAmount.GreaterThan(billing.Zero) {
 			taskBilling := billing.NewTaskBillingProvider()
+			refundOK := true
 			if err := taskBilling.SettleTaskFailed(ctx, t.TenantID, t.RequestID, t.PreDeductAmount); err != nil {
-				g.Log().Warningf(ctx, "poll: refund timed-out task %s: %v", t.PublicTaskID, err)
+				g.Log().Warningf(ctx, "poll: refund timed-out task %s: %v (usage log deferred to retry net)", t.PublicTaskID, err)
+				refundOK = false
+			}
+			if refundOK {
+				if claimed, mErr := DefaultAsyncProvider.MarkTaskSettled(ctx, t); mErr != nil {
+					g.Log().Warningf(ctx, "poll: mark refunded timed-out task %s failed, defer usage log: %v", t.PublicTaskID, mErr)
+					usageLogDeferred = true
+				} else {
+					usageLogDeferred = !claimed
+				}
+			} else {
+				usageLogDeferred = true
 			}
 			billing.CleanupPreDeduct(ctx, t.TenantID, t.RequestID+"_adjust")
 		}
 		g.Log().Infof(ctx, "poll: task %s timed out", t.PublicTaskID)
 
-		// 查询渠道信息并记录用量日志
-		var ch *common.ChannelBasicInfo
-		if t.ChannelID > 0 {
-			ch, _ = DefaultAsyncProvider.GetChannelByID(ctx, t.ChannelID)
+		// 查询渠道信息并记录用量日志（延后的由重试网补写）
+		if !usageLogDeferred {
+			var ch *common.ChannelBasicInfo
+			if t.ChannelID > 0 {
+				ch, _ = DefaultAsyncProvider.GetChannelByID(ctx, t.ChannelID)
+			}
+			recordTaskUsage(t, ch, false, "task timed out", nil)
 		}
-		recordTaskUsage(t, ch, false, "task timed out", nil)
 
 		// 更新审计记录
 		recordTaskCompletionAudit(t, "TIMEOUT", "", nil)
@@ -198,14 +215,29 @@ func handleUnsettledTasks(ctx context.Context) {
 
 		var pd privateData
 		if err := json.Unmarshal(t.PrivateData, &pd); err != nil || pd.UpstreamTaskID == "" {
-			// 无法恢复，直接退还预扣
+			// 无法恢复，直接退还预扣。用量日志同样补写（此前该分支只退款，行永久缺失）；
+			// 审计终态已由各首写者（超时网/轮询/worker）无条件落，此处不重复。
+			// 认领「已结算」标记后写，与成功行同一原则，每请求至多一条
 			g.Log().Warningf(ctx, "poll: unsettled task %s has invalid private_data, refunding", t.PublicTaskID)
 			taskBilling := billing.NewTaskBillingProvider()
 			if err := taskBilling.SettleTaskFailed(ctx, t.TenantID, t.RequestID, t.PreDeductAmount); err != nil {
 				g.Log().Errorf(ctx, "poll: refund unsettled task %s: %v", t.PublicTaskID, err)
 			} else {
 				t.BillingSettled = true
-				DefaultAsyncProvider.UpdateTask(ctx, t)
+				if claimed, mErr := DefaultAsyncProvider.MarkTaskSettled(ctx, t); mErr != nil {
+					g.Log().Warningf(ctx, "poll: mark refunded task %s failed: %v", t.PublicTaskID, mErr)
+				} else if claimed {
+					var ch *common.ChannelBasicInfo
+					if t.ChannelID > 0 {
+						ch, _ = DefaultAsyncProvider.GetChannelByID(ctx, t.ChannelID)
+					}
+					success := t.Status == "SUCCESS"
+					errMsg := ""
+					if !success {
+						errMsg = t.FailReason
+					}
+					recordTaskUsage(t, ch, success, errMsg, nil)
+				}
 			}
 			billing.CleanupPreDeduct(ctx, t.TenantID, t.RequestID+"_adjust")
 			continue
@@ -252,13 +284,22 @@ func handleUnsettledTasks(ctx context.Context) {
 				g.Log().Infof(ctx, "poll: retried settlement for task %s", t.PublicTaskID)
 			}
 		} else {
-			// 失败任务：退还预扣
+			// 失败任务：退还预扣（预扣认领即删，重放安全）。认领「已结算」标记后补写
+			// 失败行用量日志——首写在退款/认领失败窗口延后的，在此闭环，每请求至多一条
 			taskBilling := billing.NewTaskBillingProvider()
 			if err := taskBilling.SettleTaskFailed(ctx, t.TenantID, t.RequestID, t.PreDeductAmount); err != nil {
 				g.Log().Warningf(ctx, "poll: retry refund task %s: %v", t.PublicTaskID, err)
 			} else {
 				t.BillingSettled = true
-				DefaultAsyncProvider.UpdateTask(ctx, t)
+				if claimed, mErr := DefaultAsyncProvider.MarkTaskSettled(ctx, t); mErr != nil {
+					g.Log().Warningf(ctx, "poll: mark refunded task %s failed: %v", t.PublicTaskID, mErr)
+				} else if claimed {
+					var ch *common.ChannelBasicInfo
+					if t.ChannelID > 0 {
+						ch, _ = DefaultAsyncProvider.GetChannelByID(ctx, t.ChannelID)
+					}
+					recordTaskUsage(t, ch, false, t.FailReason, nil)
+				}
 				g.Log().Infof(ctx, "poll: retried refund for task %s", t.PublicTaskID)
 			}
 			billing.CleanupPreDeduct(ctx, t.TenantID, t.RequestID+"_adjust")
@@ -313,13 +354,23 @@ func handleUnsettledSyncImage(ctx context.Context, t *common.AsyncTask) {
 		return
 	}
 
-	// FAILURE：退还预扣
+	// FAILURE：退还预扣（预扣认领即删，重放安全）。认领「已结算」标记后补写失败行
+	// 用量日志——首写在退款/认领失败窗口延后的（sync_image worker 三处失败路径），
+	// 在此闭环，每请求至多一条
 	if err := taskBilling.SettleTaskFailed(ctx, t.TenantID, t.RequestID, t.PreDeductAmount); err != nil {
 		g.Log().Warningf(ctx, "poll: retry refund sync_image task %s: %v", t.PublicTaskID, err)
 		return
 	}
 	t.BillingSettled = true
-	DefaultAsyncProvider.UpdateTask(ctx, t)
+	if claimed, mErr := DefaultAsyncProvider.MarkTaskSettled(ctx, t); mErr != nil {
+		g.Log().Warningf(ctx, "poll: mark refunded sync_image task %s failed: %v", t.PublicTaskID, mErr)
+	} else if claimed {
+		var ch *common.ChannelBasicInfo
+		if t.ChannelID > 0 {
+			ch, _ = DefaultAsyncProvider.GetChannelByID(ctx, t.ChannelID)
+		}
+		recordTaskUsage(t, ch, false, t.FailReason, nil)
+	}
 	billing.CleanupPreDeduct(ctx, t.TenantID, t.RequestID+"_adjust")
 }
 
@@ -586,23 +637,34 @@ func pollSingleTask(ctx context.Context, adaptor common.TaskAdaptor, channel *co
 		recordTaskCompletionAudit(task, "SUCCESS", string(body), upstreamRespHeaders(resp))
 
 	} else if taskInfo.Status == common.TaskStatusFailure {
-		// 退还预扣费用
+		// 退还预扣费用。失败行用量日志与成功行同一原则：退款成功且认领「已结算」标记后写
+		// ——退款/认领失败延后到 handleUnsettledTasks 补写，每请求至多一条；
+		// 零预扣任务不进重试网，跳过结算块直接写
+		usageLogDeferred := false
 		if task.PreDeductAmount.GreaterThan(billing.Zero) && !task.BillingSettled {
 			taskBilling := billing.NewTaskBillingProvider()
 			if err := taskBilling.SettleTaskFailed(ctx, task.TenantID, task.RequestID, task.PreDeductAmount); err != nil {
-				g.Log().Warningf(ctx, "poll: refund failed task %s: %v", task.PublicTaskID, err)
+				g.Log().Warningf(ctx, "poll: refund failed task %s: %v (usage log deferred to retry net)", task.PublicTaskID, err)
+				usageLogDeferred = true
 			} else {
 				task.BillingSettled = true
-				DefaultAsyncProvider.UpdateTask(ctx, task)
+				if claimed, mErr := DefaultAsyncProvider.MarkTaskSettled(ctx, task); mErr != nil {
+					g.Log().Warningf(ctx, "poll: mark refunded task %s failed, defer usage log: %v", task.PublicTaskID, mErr)
+					usageLogDeferred = true
+				} else {
+					usageLogDeferred = !claimed
+				}
 			}
 			billing.CleanupPreDeduct(ctx, task.TenantID, task.RequestID+"_adjust")
 		}
 		g.Log().Infof(ctx, "poll: task %s failed: %s", task.PublicTaskID, task.FailReason)
 
-		// 记录用量日志
-		recordTaskUsage(task, channel, false, task.FailReason, nil)
+		// 记录用量日志（退款已确认或本就无需结算时；延后的由重试网补写）
+		if !usageLogDeferred {
+			recordTaskUsage(task, channel, false, task.FailReason, nil)
+		}
 
-		// 更新审计记录
+		// 更新审计记录（任务终态与计费解耦，始终立即落）
 		recordTaskCompletionAudit(task, "FAILURE", string(body), upstreamRespHeaders(resp))
 	}
 }
