@@ -208,6 +208,8 @@ interface AsyncTask {
 }
 const asyncTask = ref<AsyncTask | null>(null)
 const polling = ref(false)
+// 本次生成起点（ms）：结果占位卡右上角计时用；跨「提交中 → 轮询中」两个占位阶段连续计时
+const genStartAt = ref<number | null>(null)
 // 任务状态轮询：页面隐藏时暂停（任务在服务端继续执行），恢复可见时立即补拉
 const taskPoller = createPoller(pollLoop, 3000, { immediate: true })
 // 轮询上限：100 次实际轮询 ≈ 5 分钟（页面隐藏期间不计数），超过判定超时，防止无限轮询。
@@ -271,6 +273,7 @@ function buildBody(): Record<string, any> {
 async function generate() {
 	if (!prompt.value.trim() || !selectedModel.value) return
 	sending.value = true
+	genStartAt.value = Date.now()
 	errorMessage.value = ''
 	fallbackNotice.value = ''
 	images.value = []
@@ -640,6 +643,7 @@ function closeZoom() {
 							v-if="sending"
 							kind="image"
 							:label="effectiveMode === 'async' ? '正在提交生成任务...' : '图片生成中...'"
+							:since="genStartAt"
 						/>
 
 						<!-- 异步任务进行中：卡片式进度占位（成功由下方图片区接管） -->
@@ -649,6 +653,7 @@ function closeZoom() {
 							:progress="asyncTask.progress"
 							:label="statusLabel[asyncTask.status] || asyncTask.status"
 							:sublabel="asyncTask.id ? 'task_id: ' + asyncTask.id : ''"
+							:since="genStartAt"
 						/>
 
 						<!-- 任务失败 -->
