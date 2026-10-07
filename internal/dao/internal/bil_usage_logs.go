@@ -31,7 +31,7 @@ type BilUsageLogsColumns struct {
 	RelayMode             string // 代理模式：chat_completions / embeddings / images_generations 等
 	InputTokens           string // 输入 token 数（含缓存总输入：base + cache_read + cache_creation，跨渠道统一口径）
 	OutputTokens          string // 输出 token 数
-	TotalCost             string // 本次调用费用
+	TotalCost             string // 本次调用基础费用（不含租户/时段折扣；异步任务行含请求级附加乘数，与 bil_records 快照 BaseCost 同口径）
 	Currency              string // 货币（USD）
 	LatencyMs             string // 请求延迟（毫秒）
 	Status                string // 状态：success（成功）/ error（错误）/ timeout（超时）/ cancelled（取消）
@@ -45,7 +45,7 @@ type BilUsageLogsColumns struct {
 	OutputCost            string // 输出 token 费用
 	CacheCreationCost     string // 缓存创建费用
 	CacheReadCost         string // 缓存读取费用
-	ActualCost            string // 实际扣除费用（含折扣后）
+	ActualCost            string // 实际扣除费用（含折扣后，钱包真实扣减金额；报表聚合优先取本列，0/NULL 回退 total_cost）
 	RequestedModel        string // 用户请求的模型名
 	UpstreamModel         string // 上游实际模型名（模型映射后）
 	RequestType           string // 请求类型: 1=sync, 2=stream, 3=async, 4=websocket

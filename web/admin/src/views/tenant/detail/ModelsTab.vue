@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { ref, reactive, computed, watch, onMounted, h } from 'vue'
+import { ref, computed, watch, onMounted, h } from 'vue'
 import { Tag, Button, Space, Popconfirm, Message } from '@arco-design/web-vue'
 import type { TableColumnData } from '@arco-design/web-vue'
 import ResponsiveTable from '@/components/ResponsiveTable.vue'
 import TableStats from '@/components/TableStats.vue'
+import TenantModelPricingModal from '@/components/TenantModelPricingModal.vue'
 import request from '@/utils/request'
-// 本位币符号：定价输入控件后缀跟随本位币，输入值仍为 bil 层存储原值不折算
-import { currencySymbol } from '@/composables/useCurrency'
 
 const props = defineProps<{
   tenantId: string
@@ -17,6 +16,18 @@ const props = defineProps<{
 const modelsLoading = ref(false)
 const modelsData = ref<any[]>([])
 const allModels = ref<any[]>([])
+
+// 是否存在任一定价覆盖（独立模型表「覆盖」列）：模式/价格/折扣/补丁三键/展示字段
+function hasAnyOverride(r: any): boolean {
+  if (r.billing_mode || r.discount_ratio) return true
+  if (r.custom_input_price || r.custom_output_price || r.custom_cache_read_price || r.custom_cache_creation_price) return true
+  if (r.per_request_price) return true
+  if (r.custom_pricing_tiers?.length) return true
+  if (Array.isArray(r.custom_time_segments) || Array.isArray(r.custom_param_multipliers)) return true
+  if (r.custom_per_second_prices) return true
+  if (r.price_note || r.discount_label || r.price_change_note) return true
+  return false
+}
 
 const modelColumns: TableColumnData[] = [
   { title: '模型标识', dataIndex: 'model_code', width: 180, ellipsis: true },
@@ -32,6 +43,8 @@ const modelColumns: TableColumnData[] = [
     title: '计费', dataIndex: 'billing_mode', width: 80,
     render({ record }) {
       if (record.billing_mode === 'per_request') return h(Tag, { color: 'purple', size: 'small' }, () => '按次')
+      if (record.billing_mode === 'tiered') return h(Tag, { color: 'orange', size: 'small' }, () => '阶梯')
+      if (record.billing_mode === 'token') return h(Tag, { color: 'cyan', size: 'small' }, () => 'Token')
       return h(Tag, { color: 'arcoblue', size: 'small' }, () => '默认')
     },
   },
@@ -43,6 +56,14 @@ const modelColumns: TableColumnData[] = [
     },
   },
   {
+    title: '覆盖', dataIndex: '_override', width: 70,
+    render({ record }) {
+      return record._override
+        ? h(Tag, { color: 'orangered', size: 'small' }, () => '有')
+        : h('span', { style: 'color: var(--color-text-4)' }, '继承')
+    },
+  },
+  {
     title: '并发', dataIndex: 'max_concurrency', width: 70,
     render({ record }) { return record.max_concurrency || '-' },
   },
@@ -51,7 +72,7 @@ const modelColumns: TableColumnData[] = [
     title: '操作', dataIndex: 'actions', width: 160, fixed: 'right',
     render({ record }) {
       return h(Space, { size: 4 }, () => [
-        h(Button, { size: 'small', onClick: () => openEditModel(record) }, () => '编辑'),
+        h(Button, { size: 'small', onClick: () => openPricingModal(record) }, () => '定价'),
         h(Popconfirm, { content: '确定移除该模型？', onOk: () => removeModel(record) }, () =>
           h(Button, { size: 'small', status: 'danger' }, () => '移除')
         ),
@@ -64,7 +85,10 @@ async function fetchTenantModels() {
   modelsLoading.value = true
   try {
     const res: any = await request.get(`/admin/tenants/${props.tenantId}/models`)
-    modelsData.value = res.data?.data?.list || res.data?.list || []
+    const list = res.data?.data?.list || res.data?.list || []
+    // 「覆盖」列标记注入（响应不含 _override，前端按覆盖字段推导）
+    for (const row of list) row._override = hasAnyOverride(row)
+    modelsData.value = list
   } catch {
   } finally {
     modelsLoading.value = false
@@ -80,6 +104,19 @@ async function fetchAllModels() {
   } catch (err: any) {
     console.error('fetchAllModels failed:', err)
   }
+}
+
+// === 定价弹窗（TenantModelPricingModal，参考平台定价弹窗形态）===
+const showPricingModal = ref(false)
+const pricingModel = ref<any>(null)
+
+function openPricingModal(record: any) {
+  pricingModel.value = record
+  showPricingModal.value = true
+}
+
+function onPricingSaved() {
+  fetchTenantModels()
 }
 
 // === 分配模型弹窗 ===
@@ -122,105 +159,6 @@ async function handleAssign(done: () => void) {
     return false
   } finally {
     assignLoading.value = false
-  }
-}
-
-// === 编辑模型抽屉 ===
-const showEditModelModal = ref(false)
-const editModelLoading = ref(false)
-const editingModel = ref<any>(null)
-const editModelForm = reactive({
-  enabled: true,
-  billing_mode: null as string | null,
-  per_request_price: null as number | null,
-  discount_ratio: null as number | null,
-  max_concurrency: 5 as number | null,
-  custom_input_price: null as number | null,
-  custom_output_price: null as number | null,
-  custom_cache_read_price: null as number | null,
-  custom_cache_creation_price: null as number | null,
-  custom_pricing_tiers: [] as any[],
-})
-
-let suppressBillingWatch = false
-
-// 是否填写了任一自定义绝对价（一口价提示用：与折扣互斥，见 billing.hasTenantCustomPrice）
-const hasCustomPriceInput = computed(() =>
-	(editModelForm.custom_input_price ?? 0) > 0 ||
-	(editModelForm.custom_output_price ?? 0) > 0 ||
-	(editModelForm.custom_cache_read_price ?? 0) > 0 ||
-	(editModelForm.custom_cache_creation_price ?? 0) > 0 ||
-	(editModelForm.per_request_price ?? 0) > 0 ||
-	editModelForm.custom_pricing_tiers.length > 0,
-)
-
-function openEditModel(record: any) {
-  suppressBillingWatch = true
-  editingModel.value = record
-  editModelForm.enabled = record.enabled
-  editModelForm.billing_mode = record.billing_mode || null
-  editModelForm.per_request_price = record.per_request_price || null
-  editModelForm.discount_ratio = record.discount_ratio || null
-  editModelForm.max_concurrency = record.max_concurrency ?? 5
-  editModelForm.custom_input_price = record.custom_input_price || null
-  editModelForm.custom_output_price = record.custom_output_price || null
-  editModelForm.custom_cache_read_price = record.custom_cache_read_price || null
-  editModelForm.custom_cache_creation_price = record.custom_cache_creation_price || null
-  editModelForm.custom_pricing_tiers = record.custom_pricing_tiers?.length > 0 ? [...record.custom_pricing_tiers] : []
-  showEditModelModal.value = true
-  suppressBillingWatch = false
-}
-
-function addTenantTier() {
-  const tiers = editModelForm.custom_pricing_tiers
-  const last = tiers[tiers.length - 1]
-  const newMin = last?.max_tokens ?? 0
-  tiers.push({
-    min_tokens: newMin,
-    max_tokens: null,
-    input_price: 0,
-    output_price: 0,
-    cache_read_price: 0,
-    cache_creation_price: 0,
-  })
-  if (last && last.max_tokens === null) {
-    last.max_tokens = newMin
-  }
-}
-
-// 计费模式切换时清理互斥字段
-watch(() => editModelForm.billing_mode, (mode) => {
-  if (suppressBillingWatch) return
-  if (!mode) {
-    // 默认模式：清空自定义价格，保留折扣
-    editModelForm.custom_input_price = null
-    editModelForm.custom_output_price = null
-    editModelForm.custom_cache_read_price = null
-    editModelForm.custom_cache_creation_price = null
-    editModelForm.per_request_price = null
-    editModelForm.custom_pricing_tiers = []
-  } else {
-    // 自定义价格模式：清空折扣比例
-    editModelForm.discount_ratio = null
-  }
-})
-
-async function handleEditModel() {
-  if (!editingModel.value) return
-  editModelLoading.value = true
-  try {
-    const payload: any = {
-      ...editModelForm,
-      version: editingModel.value.version,
-    }
-    await request.put(`/admin/tenants/${props.tenantId}/models/${editingModel.value.model_id}`, payload)
-    Message.success('更新成功')
-    showEditModelModal.value = false
-    fetchTenantModels()
-  } catch {
-    // 错误已由拦截器统一提示
-  } finally {
-    editModelLoading.value = false
   }
 }
 
@@ -398,7 +336,7 @@ defineExpose({ openPreviewModal })
       :loading="modelsLoading"
       :stripe="true"
       row-key="id"
-      :scroll="{ x: 1100 }"
+      :scroll="{ x: 1200 }"
       card-title-key="model_code"
       card-subtitle-key="model_name"
       card-badge-key="enabled"
@@ -461,159 +399,15 @@ defineExpose({ openPreviewModal })
     />
   </AModal>
 
-  <!-- 编辑模型配置抽屉 -->
-  <ADrawer
-    v-model:visible="showEditModelModal"
-    :title="`编辑模型 - ${editingModel?.model_name || ''}`"
-    :width="640"
-    :mask-closable="false"
-    :footer="true"
-  >
-    <AForm :model="editModelForm" :auto-label-width="true" layout="vertical">
-      <AFormItem label="启用">
-        <ASwitch v-model="editModelForm.enabled" />
-      </AFormItem>
-      <AFormItem label="单模型并发上限">
-        <AInputNumber v-model="editModelForm.max_concurrency" :min="0" placeholder="默认5" class="w-full" />
-      </AFormItem>
-
-      <AFormItem label="计费模式">
-        <ARadioGroup v-model="editModelForm.billing_mode" type="button">
-          <ARadio value="">默认</ARadio>
-          <ARadio value="token">Token</ARadio>
-          <ARadio value="per_request">按次</ARadio>
-          <ARadio value="tiered">阶梯</ARadio>
-        </ARadioGroup>
-      </AFormItem>
-
-      <!-- 默认模式：仅折扣比例 -->
-      <template v-if="!editModelForm.billing_mode">
-        <ADivider margin="8px">折扣</ADivider>
-        <div style="color: var(--ta-text-tertiary); font-size: 12px; margin-bottom: 12px">使用模型基础定价 × 折扣比例</div>
-        <AFormItem label="折扣比例">
-          <AInputNumber v-model="editModelForm.discount_ratio" :min="0" :max="1" :step="0.05" :precision="2" placeholder="如 0.8 = 8折" class="w-full" />
-        </AFormItem>
-      </template>
-
-      <!-- 一口价提示：配置了自定义绝对价后折扣比例与等级折扣不再生效（防折上折） -->
-      <div
-        v-if="editModelForm.discount_ratio != null && editModelForm.discount_ratio !== 1 && hasCustomPriceInput"
-        style="margin-bottom: 12px; padding: 6px 10px; border-radius: 4px; background: var(--ta-bg-secondary, #f7f8fa); color: var(--ta-text-secondary); font-size: 12px"
-      >
-        已配置自定义价格（一口价）：折扣比例与租户等级折扣不会叠加生效，最终价即自定义价格
-      </div>
-
-      <!-- Token 模式：自定义价格 -->
-      <template v-if="editModelForm.billing_mode === 'token'">
-        <ADivider margin="8px">自定义价格</ADivider>
-        <div style="color: var(--ta-text-tertiary); font-size: 12px; margin-bottom: 12px">留空则使用模型基础定价</div>
-        <div class="grid grid-cols-2 gap-x-3">
-          <AFormItem label="输入价格">
-            <AInputNumber v-model="editModelForm.custom_input_price" :min="0" :precision="4" placeholder="默认" class="w-full">
-              <template #suffix>{{ currencySymbol }} / 1M</template>
-            </AInputNumber>
-          </AFormItem>
-          <AFormItem label="输出价格">
-            <AInputNumber v-model="editModelForm.custom_output_price" :min="0" :precision="4" placeholder="默认" class="w-full">
-              <template #suffix>{{ currencySymbol }} / 1M</template>
-            </AInputNumber>
-          </AFormItem>
-          <AFormItem label="缓存读取价格">
-            <AInputNumber v-model="editModelForm.custom_cache_read_price" :min="0" :precision="4" placeholder="默认" class="w-full">
-              <template #suffix>{{ currencySymbol }} / 1M</template>
-            </AInputNumber>
-          </AFormItem>
-          <AFormItem label="缓存创建价格">
-            <AInputNumber v-model="editModelForm.custom_cache_creation_price" :min="0" :precision="4" placeholder="默认" class="w-full">
-              <template #suffix>{{ currencySymbol }} / 1M</template>
-            </AInputNumber>
-          </AFormItem>
-        </div>
-      </template>
-
-      <!-- 按次计费 -->
-      <template v-if="editModelForm.billing_mode === 'per_request'">
-        <ADivider margin="8px">按次定价</ADivider>
-        <AFormItem label="按次单价">
-          <AInputNumber v-model="editModelForm.per_request_price" :min="0" :precision="4" placeholder="每次调用价格" class="w-full">
-            <template #suffix>{{ currencySymbol }} / 次</template>
-          </AInputNumber>
-        </AFormItem>
-      </template>
-
-      <!-- 阶梯计费 -->
-      <template v-if="editModelForm.billing_mode === 'tiered'">
-        <ADivider margin="8px">阶梯定价</ADivider>
-        <div style="color: var(--ta-text-tertiary); font-size: 12px; margin-bottom: 12px">按 Token 用量分段设置不同价格，留空则使用模型基础阶梯定价</div>
-        <div v-for="(tier, index) in editModelForm.custom_pricing_tiers" :key="index" class="tier-card">
-          <div class="tier-header">
-            <span class="tier-label">第 {{ index + 1 }} 梯</span>
-            <AButton v-if="editModelForm.custom_pricing_tiers.length > 1" size="mini" status="danger" @click="editModelForm.custom_pricing_tiers.splice(index, 1)">删除</AButton>
-          </div>
-          <div class="grid grid-cols-2 gap-x-3">
-            <AFormItem label="起始 Token">
-              <AInputNumber v-model="tier.min_tokens" :min="0" :step="1000" placeholder="0" class="w-full" />
-            </AFormItem>
-            <AFormItem label="结束 Token">
-              <AInputNumber v-if="index < editModelForm.custom_pricing_tiers.length - 1" v-model="tier.max_tokens" :min="0" :step="1000" placeholder="上限" class="w-full" />
-              <AInput v-else model-value="无上限" disabled class="w-full" />
-            </AFormItem>
-          </div>
-          <div class="grid grid-cols-2 gap-x-3 mt-2">
-            <AFormItem label="输入价格">
-              <AInputNumber v-model="tier.input_price" :min="0" :precision="4" class="w-full">
-                <template #suffix>{{ currencySymbol }}/1M</template>
-              </AInputNumber>
-            </AFormItem>
-            <AFormItem label="输出价格">
-              <AInputNumber v-model="tier.output_price" :min="0" :precision="4" class="w-full">
-                <template #suffix>{{ currencySymbol }}/1M</template>
-              </AInputNumber>
-            </AFormItem>
-          </div>
-          <div class="grid grid-cols-2 gap-x-3 mt-2">
-            <AFormItem label="缓存读取价格">
-              <AInputNumber v-model="tier.cache_read_price" :min="0" :precision="4" class="w-full">
-                <template #suffix>{{ currencySymbol }}/1M</template>
-              </AInputNumber>
-            </AFormItem>
-            <AFormItem label="缓存创建价格">
-              <AInputNumber v-model="tier.cache_creation_price" :min="0" :precision="4" class="w-full">
-                <template #suffix>{{ currencySymbol }}/1M</template>
-              </AInputNumber>
-            </AFormItem>
-          </div>
-        </div>
-        <AButton type="dashed" long @click="addTenantTier" class="mt-2">+ 添加梯度</AButton>
-      </template>
-
-    </AForm>
-    <template #footer>
-      <ASpace>
-        <AButton @click="showEditModelModal = false">取消</AButton>
-        <AButton type="primary" :loading="editModelLoading" @click="handleEditModel">保存</AButton>
-      </ASpace>
-    </template>
-  </ADrawer>
+  <!-- 模型定价弹窗（参考平台定价弹窗形态：分节布局 + 覆盖三态 + 平台对照） -->
+  <TenantModelPricingModal
+    v-model:visible="showPricingModal"
+    :tenant-id="tenantId"
+    :model="pricingModel"
+    @saved="onPricingSaved"
+  />
 </template>
 
 <style scoped>
 @import './common.css';
-.tier-card {
-  padding: 12px 16px;
-  background: var(--color-fill-1);
-  border-radius: 8px;
-  margin-bottom: 8px;
-}
-.tier-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 8px;
-}
-.tier-label {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--ta-text-secondary);
-}
 </style>

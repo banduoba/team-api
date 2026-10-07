@@ -329,8 +329,10 @@ async function submitAsync(api: ReturnType<typeof createPlaygroundApi>, body: Re
 }
 
 // generateSync 走同步端点：阻塞一次性返回图片与用量。
+// 超时 600s 与后端图片模式强制下限（relay ImagesGenerationTimeoutSecs）对齐：
+// b64_json 响应体达 MB 级，慢网络下载耗时会远超生成耗时，前端超时须不早于后端放弃。
 async function generateSync(api: ReturnType<typeof createPlaygroundApi>, body: Record<string, any>) {
-	const res = await api.post('/v1/images/generations', body, { timeout: 300_000 })
+	const res = await api.post('/v1/images/generations', body, { timeout: 600_000 })
 	const data = res.data
 	images.value = data.data || []
 	const usage = data.usage || {}

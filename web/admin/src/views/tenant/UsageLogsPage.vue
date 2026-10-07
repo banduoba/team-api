@@ -273,6 +273,36 @@ const tokenCostLabels: Record<string, string> = {
 	cache_creation_1h: '缓存创建(1小时)',
 }
 
+// 快照 ratio_multipliers 的 key → 中文标签（任务路径附加乘数：视频输入折扣、
+// 画质/时长倍率、参数倍率等；未收录的 key 原样展示）
+const ratioMultiplierLabels: Record<string, string> = {
+	video_input: '视频输入折扣',
+	quality: '画质倍率',
+	duration_multiplier: '时长倍率',
+	param_multiplier: '参数倍率',
+}
+
+// 快照附加乘数 → 排序后的键值列表：=1 不展示（后端如实记录乘数=1 的项），
+// 历史快照无 ratio_multipliers 字段时返回空。键排序保证展示顺序稳定（后端 map 无序）
+function snapshotExtraRatios(sp: any): Array<[string, number]> {
+	const ratios = sp?.multipliers?.ratio_multipliers
+	if (!ratios) return []
+	return Object.entries(ratios)
+		.filter(([, v]) => typeof v === 'number' && v > 0 && v !== 1)
+		.sort((a, b) => a[0].localeCompare(b[0]))
+}
+
+// 综合倍率：租户 × 时段 × 附加乘数连乘，与后端 buildTokenCosts 的乘数链一致
+// （Token 费用行算式中的 multiplier 即该值）。历史快照缺失的字段按 1 跳过
+function snapshotCombinedMultiplier(sp: any): number {
+	const m = sp?.multipliers
+	if (!m) return 1
+	let combined = m.tenant_multiplier || 1
+	if (m.time_multiplier && m.time_multiplier > 0) combined *= m.time_multiplier
+	for (const [, v] of snapshotExtraRatios(sp)) combined *= v
+	return combined
+}
+
 // 快照计费模式是否为 token 语义（token/tiered 展示每 1M 单价行；
 // per_request/per_second/special 的输入输出价恒 0，展示会误导）
 function snapshotIsTokenPricing(sp: any): boolean {
@@ -1083,9 +1113,26 @@ const { exporting, exportFile } = useExport({
 											{{ (snapshot.multipliers.tenant_multiplier || 1).toFixed(4) }}x
 										</span>
 									</div>
-									<div v-if="snapshot.multipliers.discount_ratio && snapshot.multipliers.discount_ratio !== 1" class="snapshot-row">
-										<span class="snapshot-label">折扣比例</span>
-										<span class="snapshot-value text-success">{{ (snapshot.multipliers.discount_ratio).toFixed(4) }}x</span>
+									<!-- 时段倍率：历史快照无该字段或未命中时段（=1）不显示；命中的时段名作后缀 -->
+									<div v-if="snapshot.multipliers.time_multiplier && snapshot.multipliers.time_multiplier !== 1" class="snapshot-row">
+										<span class="snapshot-label">时段倍率</span>
+										<span class="snapshot-value" :class="snapshot.multipliers.time_multiplier < 1 ? 'text-success' : ''">
+											{{ snapshot.multipliers.time_multiplier.toFixed(4) }}x<span v-if="snapshot.multipliers.time_rule"> · {{ snapshot.multipliers.time_rule }}</span>
+										</span>
+									</div>
+									<!-- 附加乘数清单（任务路径）：视频输入折扣、画质/时长倍率、参数倍率等，=1 不显示；参数倍率附命中规则说明 -->
+									<div v-for="[key, ratio] in snapshotExtraRatios(snapshot)" :key="key" class="snapshot-row">
+										<span class="snapshot-label">{{ ratioMultiplierLabels[key] || key }}</span>
+										<span class="snapshot-value" :class="ratio < 1 ? 'text-success' : ''">
+											{{ ratio.toFixed(4) }}x<span v-if="key === 'param_multiplier' && snapshot.multipliers.param_matched"> · {{ snapshot.multipliers.param_matched }}</span>
+										</span>
+									</div>
+									<!-- 综合倍率：上方各倍率连乘的结果，与 Token 费用行算式中的乘数一致；=1 不显示 -->
+									<div v-if="snapshotCombinedMultiplier(snapshot) !== 1" class="snapshot-row">
+										<span class="snapshot-label">综合倍率</span>
+										<span class="snapshot-value" :class="snapshotCombinedMultiplier(snapshot) < 1 ? 'text-success' : ''">
+											{{ snapshotCombinedMultiplier(snapshot).toFixed(4) }}x
+										</span>
 									</div>
 								</div>
 							</div>

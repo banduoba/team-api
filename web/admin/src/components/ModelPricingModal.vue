@@ -12,6 +12,12 @@ import PricingTimeSegmentsEditor, {
 	timeSegmentPayloadFrom,
 } from './PricingTimeSegmentsEditor.vue'
 import PricingParamRulesEditor, { type ParamRuleRow, paramRuleRowsFromAPI, paramRulePayloadFrom } from './PricingParamRulesEditor.vue'
+import PerSecondMatrixEditor, {
+	type PerSecondRow,
+	perSecondRowsFromAPI,
+	perSecondPayloadFrom,
+	perSecondBasePriceOf,
+} from './PerSecondMatrixEditor.vue'
 import { availableSchemeOptions, resolvePricingSchemeEditor } from './pricingSchemeEditors'
 
 // 本位币符号：定价输入控件后缀跟随本位币，输入值仍为 bil 层存储原值不折算
@@ -77,59 +83,19 @@ function createEmptyItem(mode: string) {
 
 // ============================================================
 // Per-Second Mode（按秒计费：分辨率规格 × 每秒单价矩阵）
+// 行编辑/校验/基准价逻辑在 PerSecondMatrixEditor 组件前置块（平台与租户覆盖共用）
 // ============================================================
-interface PerSecondRow {
-	spec: string // 分辨率/规格键，如 480p / 720p / 1080p / *（兜底）
-	price: number // 每秒单价（本位币）
-}
 const perSecondRows = reactive<PerSecondRow[]>([])
-
-// 常用规格快捷键（点击追加行）
-const perSecondSpecPresets = ['480p', '720p', '1080p', '*']
-
-function addPerSecondRow(spec = '') {
-	perSecondRows.push({ spec, price: 0 })
-}
-
-function removePerSecondRow(index: number) {
-	perSecondRows.splice(index, 1)
-}
 
 // 回显：后端 map → 行编辑器
 function loadPerSecondPrices(prices: Record<string, number> | null | undefined) {
 	perSecondRows.length = 0
-	if (!prices) return
-	for (const [spec, price] of Object.entries(prices)) {
-		perSecondRows.push({ spec, price: Number(price) || 0 })
-	}
-}
-
-// 行 → 提交 map；requirePositive=true 要求至少一档正价（计费定价必需，官方参考价不强制）。
-// map 为 null 表示校验失败（error 为中文提示文案）
-function buildPerSecondMap(rows: PerSecondRow[], requirePositive: boolean): { map: Record<string, number> | null; error?: string } {
-	const map: Record<string, number> = {}
-	let hasPositive = false
-	for (const row of rows) {
-		const spec = row.spec.trim()
-		if (!spec) continue
-		if (map[spec] !== undefined) {
-			return { map: null, error: `按秒计费规格「${spec}」重复` }
-		}
-		if (row.price < 0) {
-			return { map: null, error: `按秒计费规格「${spec}」单价不能为负` }
-		}
-		map[spec] = row.price
-		if (row.price > 0) hasPositive = true
-	}
-	if (requirePositive && !hasPositive) {
-		return { map: null, error: '按秒计费至少配置一档正价（建议额外配置 * 兜底价）' }
-	}
-	return { map }
+	perSecondRows.push(...perSecondRowsFromAPI(prices))
 }
 
 // 主定价按秒矩阵：校验失败 Message 提示并返回 null
 function buildPerSecondPrices(): Record<string, number> | null {
-	const result = buildPerSecondMap(perSecondRows, true)
+	const result = perSecondPayloadFrom(perSecondRows, true)
 	if (result.map === null) {
 		if (result.error) Message.warning(result.error)
 		return null
@@ -139,10 +105,7 @@ function buildPerSecondPrices(): Record<string, number> | null {
 
 // 时段预览基准价：优先 * 兜底价，否则矩阵最低正价
 function perSecondBasePrice(): number {
-	const prices = perSecondRows.map((r) => Number(r.price) || 0).filter((p) => p > 0)
-	if (prices.length === 0) return 0
-	const wildcard = perSecondRows.find((r) => r.spec.trim() === '*')
-	return wildcard && wildcard.price > 0 ? wildcard.price : Math.min(...prices)
+	return perSecondBasePriceOf(perSecondRows)
 }
 
 function resetEditorDefaults() {
@@ -291,10 +254,6 @@ const hasOfficialPricing = computed(() => {
 
 function addOfficialPerSecondRow(spec = '') {
 	officialPerSecondRows.push({ spec, price: 0 })
-}
-
-function removeOfficialPerSecondRow(index: number) {
-	officialPerSecondRows.splice(index, 1)
 }
 
 // 保证官方定价首行存在：模板直接绑定 officialItems[0]，空数组会渲染报错；
@@ -863,8 +822,7 @@ watch(editorBillingMode, (mode) => {
 	}
 	// 切到按秒模式时给一个常见起始模板（已手动编辑过则不覆盖）
 	if (mode === 'per_second' && perSecondRows.length === 0) {
-		addPerSecondRow('720p')
-		addPerSecondRow('*')
+		perSecondRows.push({ spec: '720p', price: 0 }, { spec: '*', price: 0 })
 	}
 })
 
@@ -927,7 +885,7 @@ async function savePricing() {
 		}
 		// 官方按秒矩阵：重复规格/负价校验（官方价为可选参照，空矩阵=未配置交后端清除，不强制正价）
 		if (officialBillingMode.value === 'per_second') {
-			const officialPerSecond = buildPerSecondMap(officialPerSecondRows, false)
+			const officialPerSecond = perSecondPayloadFrom(officialPerSecondRows, false)
 			if (officialPerSecond.map === null) {
 				if (officialPerSecond.error) Message.warning(officialPerSecond.error)
 				editorSaving.value = false
@@ -1126,48 +1084,7 @@ watch(() => props.visible, (val) => {
 							<h3>按秒定价</h3>
 							<span class="section-hint">按视频时长（秒）计费，费用 = 命中规格单价 × 秒数；<code>*</code> 为兜底价（请求规格未命中时使用）</span>
 						</div>
-						<div class="per-second-card">
-							<div v-if="perSecondRows.length" class="per-second-col-head">
-								<span>规格</span>
-								<span>每秒单价</span>
-								<span class="per-second-op-col"></span>
-							</div>
-							<div v-for="(row, index) in perSecondRows" :key="index" class="per-second-row">
-								<AInput
-									v-model="row.spec"
-									placeholder="如 720p / 1080p / *（兜底）"
-									:max-length="32"
-									class="per-second-spec"
-								/>
-								<AInputNumber
-									v-model="row.price"
-									:min="0"
-									:precision="6"
-									placeholder="0"
-									class="per-second-price"
-								>
-									<template #suffix>{{ currencySymbol }} / 秒</template>
-								</AInputNumber>
-								<AButton
-									size="mini"
-									status="danger"
-									title="删除该规格"
-									@click="removePerSecondRow(index)"
-								>✕</AButton>
-							</div>
-							<div v-if="!perSecondRows.length" class="per-second-empty">
-								暂无规格，点击下方按钮或预设快捷添加
-							</div>
-						</div>
-						<div class="flex items-center gap-2 mt-2">
-							<AButton size="small" type="outline" @click="addPerSecondRow()">+ 添加规格</AButton>
-							<AButton
-								v-for="preset in perSecondSpecPresets"
-								:key="preset"
-								size="mini"
-								@click="addPerSecondRow(preset)"
-							>{{ preset }}</AButton>
-						</div>
+						<PerSecondMatrixEditor :rows="perSecondRows" />
 					</div>
 				</template>
 
@@ -1474,48 +1391,7 @@ watch(() => props.visible, (val) => {
 
 			<!-- 官方按秒定价（数据源无按秒价，按官方公布价格手动填写） -->
 			<template v-else-if="officialBillingMode === 'per_second'">
-				<div class="per-second-card">
-					<div v-if="officialPerSecondRows.length" class="per-second-col-head">
-						<span>规格</span>
-						<span>每秒单价</span>
-						<span class="per-second-op-col"></span>
-					</div>
-					<div v-for="(row, index) in officialPerSecondRows" :key="index" class="per-second-row">
-						<AInput
-							v-model="row.spec"
-							placeholder="如 720p / 1080p / *（兜底）"
-							:max-length="32"
-							class="per-second-spec"
-						/>
-						<AInputNumber
-							v-model="row.price"
-							:min="0"
-							:precision="6"
-							placeholder="0"
-							class="per-second-price"
-						>
-							<template #suffix>{{ currencySymbol }} / 秒</template>
-						</AInputNumber>
-						<AButton
-							size="mini"
-							status="danger"
-							title="删除该规格"
-							@click="removeOfficialPerSecondRow(index)"
-						>−</AButton>
-					</div>
-					<div v-if="!officialPerSecondRows.length" class="per-second-empty">
-						数据源无按秒价格，请按官方公布价格手动填写
-					</div>
-				</div>
-				<div class="flex items-center gap-2 mt-2">
-					<AButton size="small" type="outline" @click="addOfficialPerSecondRow()">+ 添加规格</AButton>
-					<AButton
-						v-for="preset in perSecondSpecPresets"
-						:key="preset"
-						size="mini"
-						@click="addOfficialPerSecondRow(preset)"
-					>{{ preset }}</AButton>
-				</div>
+				<PerSecondMatrixEditor :rows="officialPerSecondRows" />
 			</template>
 
 			<!-- 官方阶梯定价（与我方阶梯同构：逐档 min/max/输入/输出/缓存价） -->
@@ -1716,54 +1592,6 @@ watch(() => props.visible, (val) => {
 	font-size: 13px;
 	font-weight: 600;
 	color: var(--ta-text-secondary);
-}
-
-/* 按秒定价：单卡片行式紧凑布局（规格 + 单价 + 删除一行排布） */
-.per-second-card {
-	padding: 10px 12px;
-	background: var(--color-fill-1);
-	border: 1px solid var(--ta-border-light);
-	border-radius: 8px;
-}
-
-.per-second-col-head {
-	display: flex;
-	align-items: center;
-	gap: 8px;
-	margin-bottom: 6px;
-	font-size: 12px;
-	color: var(--ta-text-tertiary);
-}
-
-.per-second-row {
-	display: flex;
-	align-items: center;
-	gap: 8px;
-}
-
-.per-second-row + .per-second-row {
-	margin-top: 6px;
-}
-
-.per-second-spec {
-	flex: 1 1 40%;
-	min-width: 0;
-}
-
-.per-second-price {
-	flex: 1;
-	min-width: 0;
-}
-
-.per-second-op-col {
-	flex: 0 0 28px;
-}
-
-.per-second-empty {
-	font-size: 12px;
-	color: var(--ta-text-tertiary);
-	text-align: center;
-	padding: 6px 0;
 }
 
 /* 计费模式行右上角工具组：官方价状态 + 快速折扣录入 + 折扣重算 */

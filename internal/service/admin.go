@@ -112,6 +112,7 @@ type (
 		// 注意与 /admin/channels 的区别：后者是渠道管理列表（分页 + 健康度联表 + 运行态），
 		// 下拉场景不要用它 —— 那是本接口存在的意义。
 		ListChannelOptions(ctx context.Context, _ *v1.ChannelOptionsReq) (*v1.ChannelOptionsRes, error)
+		// ListChannels 获取渠道列表
 		ListChannels(ctx context.Context, req *v1.ChannelListReq) (*v1.ChannelListRes, error)
 		// CloneChannel 克隆渠道
 		CloneChannel(ctx context.Context, req *v1.ChannelCloneReq) (*v1.ChannelCloneRes, error)
