@@ -177,8 +177,8 @@ onMounted(fetchLevels)
         <AFormItem label="最大并发数">
           <AInputNumber v-model="formData.max_concurrency" :min="0" class="w-full" placeholder="0 = 不限制" />
         </AFormItem>
-        <AFormItem label="价格乘数">
-          <AInputNumber v-model="formData.price_multiplier" :min="0.01" :max="2" :step="0.05" :precision="4" class="w-full" placeholder="1.0 = 原价，0.9 = 九折" />
+        <AFormItem label="价格乘数" extra="仅支持折扣（0~1），1.0 = 原价">
+          <AInputNumber v-model="formData.price_multiplier" :min="0.01" :max="1" :step="0.05" :precision="4" class="w-full" placeholder="1.0 = 原价，0.9 = 九折" />
         </AFormItem>
         <AFormItem label="排序权重">
           <AInputNumber v-model="formData.sort_order" :min="0" class="w-full" />

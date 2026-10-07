@@ -689,6 +689,13 @@ func (s *sAdmin) UpdateTenant(ctx context.Context, req *v1.TenantUpdateReq) (*v1
 		return nil, err
 	}
 
+	// 手动调级后失效价格缓存与并发限制缓存（等级折扣/并发上限跟随等级），
+	// 与充值自动升级路径（billing.CheckAndUpgradeLevel）行为对齐；
+	// 不清除则旧折扣在 600s 定价缓存 TTL 内继续生效
+	if req.Level != nil {
+		billing.InvalidateTenantLevelCaches(ctx, req.Id)
+	}
+
 	return nil, nil
 }
 

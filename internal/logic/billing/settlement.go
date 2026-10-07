@@ -489,40 +489,6 @@ func createBillingRecord(ctx context.Context, tenantID, userID, apiKeyID, channe
 	return id, nil
 }
 
-// UpdateUsageLogCost 更新用量日志的实际费用
-func UpdateUsageLogCost(ctx context.Context, requestID string, totalCost float64, inputTokens, outputTokens int) {
-	dao.BilUsageLogs.Ctx(ctx).
-		Where("request_id", requestID).
-		Data(do.BilUsageLogs{
-			TotalCost:    totalCost,
-			InputTokens:  inputTokens,
-			OutputTokens: outputTokens,
-		}).Update()
-}
-
-// UpdateUsageLogCostWithSnapshot 更新用量日志的费用、token 明细和计费快照
-func UpdateUsageLogCostWithSnapshot(ctx context.Context, requestID string, breakdown *CostBreakdown, totalCost float64, snapshotJSON, summaryText string) {
-	data := do.BilUsageLogs{
-		TotalCost:           breakdown.BaseCost,
-		InputTokens:         breakdown.InputTokens,
-		OutputTokens:        breakdown.OutputTokens,
-		InputCost:           breakdown.InputCost,
-		OutputCost:          breakdown.OutputCost,
-		CacheCreationTokens: breakdown.CacheCreationTokens,
-		CacheReadTokens:     breakdown.CacheReadTokens,
-		CacheCreationCost:   breakdown.CacheCreationCost,
-		CacheReadCost:       breakdown.CacheReadCost,
-		ActualCost:          totalCost,
-		BillingSummary:      summaryText,
-	}
-	if snapshotJSON != "" {
-		data.BillingSnapshot = snapshotJSON
-	}
-	dao.BilUsageLogs.Ctx(ctx).
-		Where("request_id", requestID).
-		Data(data).Update()
-}
-
 // createBillingRecordWithSnapshot 创建计费记录（含 cache token 和完整快照）。依赖调用方传入携带事务的 ctx
 func createBillingRecordWithSnapshot(ctx context.Context, tenantID, userID, apiKeyID, channelID int64,
 	modelName, requestID, relayMode string,

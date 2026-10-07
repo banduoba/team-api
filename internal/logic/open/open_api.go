@@ -966,7 +966,7 @@ func (s *sOpen) OpenProjectGet(ctx context.Context, req *v1.OpenProjectGetReq) (
 		Where("tenant_id", tenantID).
 		Where("project_id", req.Id).
 		Where("created_at >= date_trunc('month', NOW())").
-		Fields("COALESCE(SUM(actual_cost), 0) as total_cost, COUNT(*) as request_count").
+		Fields("COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost, COUNT(*) as request_count").
 		Scan(&monthUsage)
 
 	res := &v1.OpenProjectGetRes{
@@ -1320,7 +1320,7 @@ func (s *sOpen) OpenProjectUsageStats(ctx context.Context, req *v1.OpenProjectUs
 	dateCondition(dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("project_id", req.Id).
-		Fields("COALESCE(SUM(actual_cost), 0) as total_cost, COUNT(*) as request_count, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens")).
+		Fields("COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost, COUNT(*) as request_count, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens")).
 		Scan(&totalStats)
 
 	// 每日趋势
@@ -1335,7 +1335,7 @@ func (s *sOpen) OpenProjectUsageStats(ctx context.Context, req *v1.OpenProjectUs
 	dateCondition(dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("project_id", req.Id).
-		Fields("DATE(created_at) as date, COUNT(*) as request_count, COALESCE(SUM(actual_cost), 0) as total_cost, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens")).
+		Fields("DATE(created_at) as date, COUNT(*) as request_count, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens")).
 		Group("DATE(created_at)").OrderAsc("date").Scan(&dailyStats)
 
 	// 模型分布（Top 10）
@@ -1348,7 +1348,7 @@ func (s *sOpen) OpenProjectUsageStats(ctx context.Context, req *v1.OpenProjectUs
 	dateCondition(dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("project_id", req.Id).
-		Fields("model_name, COUNT(*) as request_count, COALESCE(SUM(actual_cost), 0) as total_cost")).
+		Fields("model_name, COUNT(*) as request_count, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost")).
 		Group("model_name").OrderDesc("total_cost").Limit(10).Scan(&modelStats)
 
 	daily := make([]v1.OpenProjectDailyStat, 0, len(dailyStats))

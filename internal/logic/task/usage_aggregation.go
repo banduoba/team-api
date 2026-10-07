@@ -26,7 +26,7 @@ SELECT
     COUNT(*)                                    AS request_count,
     COALESCE(SUM(input_tokens), 0)              AS input_tokens,
     COALESCE(SUM(output_tokens), 0)             AS output_tokens,
-    COALESCE(SUM(total_cost), 0)                AS total_cost,
+    COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0)                AS total_cost,
     COALESCE(SUM(account_cost), 0)              AS account_cost,
     COALESCE(SUM(latency_ms), 0)                AS sum_latency_ms,
     COALESCE(SUM(first_token_ms), 0)            AS sum_first_token_ms,

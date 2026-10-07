@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, onMounted, onUnmounted } from 'vue'
 import Icon from '@/components/common/Icon.vue'
 
 // 卡片式异步任务加载占位：按成品形状（图片 1:1 / 视频 16:9）占位的动效卡片，
@@ -16,6 +16,8 @@ const props = withDefaults(
 		sublabel?: string
 		/** 紧凑形态：占位尺寸由「宽度撑满」改为「左半侧小卡片」 */
 		compact?: boolean
+		/** 计时起点（ms 时间戳）：传入后右上角显示已用时长（mm:ss 随秒跳动），不传不显示 */
+		since?: number | null
 	}>(),
 	{
 		kind: 'image',
@@ -23,6 +25,7 @@ const props = withDefaults(
 		label: '生成中...',
 		sublabel: '',
 		compact: false,
+		since: null,
 	},
 )
 
@@ -43,6 +46,27 @@ const dashOffset = computed(() => CIRCUMFERENCE * (1 - (pct.value ?? 0) / 100))
 // 渐变 id 按实例自增，避免同页多个卡片时 url(#id) 引用错乱
 let seq = 0
 const gradId = `gen-grad-${++seq}`
+
+// 已用时长计时：卡片仅在「生成进行中」渲染，挂载起周期刷新当前时刻，以 since 为零点取差值；
+// 卡片卸载自动停表，父组件无需清理。250ms 一拍保证秒位跳变及时
+const now = ref(Date.now())
+let tick: number | undefined
+onMounted(() => {
+	tick = window.setInterval(() => {
+		now.value = Date.now()
+	}, 250)
+})
+onUnmounted(() => window.clearInterval(tick))
+
+const elapsedText = computed(() => {
+	if (!props.since) return ''
+	const sec = Math.max(0, Math.floor((now.value - props.since) / 1000))
+	const h = Math.floor(sec / 3600)
+	const m = Math.floor((sec % 3600) / 60)
+	const s = sec % 60
+	const pad = (n: number) => String(n).padStart(2, '0')
+	return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`
+})
 </script>
 
 <template>
@@ -58,6 +82,12 @@ const gradId = `gen-grad-${++seq}`
 		<div class="gen-blob gen-blob--a"></div>
 		<div class="gen-blob gen-blob--b"></div>
 		<div class="gen-sheen"></div>
+
+		<!-- 右上角：已用时长徽标（传入 since 时显示） -->
+		<div v-if="elapsedText" class="gen-timer">
+			<Icon name="clock" size="xs" />
+			<span>{{ elapsedText }}</span>
+		</div>
 
 		<!-- 中央：进度环 + 状态文案 -->
 		<div class="gen-center">
@@ -149,6 +179,33 @@ const gradId = `gen-grad-${++seq}`
 	font-size: 12px;
 }
 .gen-card--compact .gen-sublabel {
+	font-size: 10px;
+}
+
+/* 右上角计时徽标：白底毛玻璃小胶囊，tabular-nums 保证数字跳变时宽度稳定 */
+.gen-timer {
+	position: absolute;
+	top: 10px;
+	right: 10px;
+	z-index: 1;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 3px 9px;
+	border-radius: 9999px;
+	background: rgba(255, 255, 255, 0.78);
+	backdrop-filter: blur(8px);
+	border: 1px solid rgba(153, 246, 228, 0.9);
+	font-size: 11px;
+	font-weight: 600;
+	color: #0f766e;
+	font-variant-numeric: tabular-nums;
+	line-height: 1;
+}
+.gen-card--compact .gen-timer {
+	top: 8px;
+	right: 8px;
+	padding: 2px 7px;
 	font-size: 10px;
 }
 

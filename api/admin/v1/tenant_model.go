@@ -31,6 +31,14 @@ type TenantModelItem struct {
 	CustomCacheCreationPrice *float64       `json:"custom_cache_creation_price"`
 	CustomPricingTiers       []*PricingTier `json:"custom_pricing_tiers"`
 	Multiplier               float64        `json:"multiplier"`
+	// 扩展计费覆盖（custom_pricing 补丁展开）：nil/null=继承平台；空数组=显式关闭；非空=整体替换
+	CustomPerSecondPrices  *map[string]float64   `json:"custom_per_second_prices"` // nil=继承
+	CustomTimeSegments     []TimeSegmentItem     `json:"custom_time_segments"`     // null=继承 / []=关闭 / 非空=覆盖
+	CustomParamMultipliers []ParamMultiplierItem `json:"custom_param_multipliers"` // 同上
+	// 展示字段覆盖：nil=继承平台
+	PriceNote       *string `json:"price_note"`
+	DiscountLabel   *string `json:"discount_label"`
+	PriceChangeNote *string `json:"price_change_note"`
 }
 
 // PricingTier 阶梯定价项（租户自定义阶梯时使用）
@@ -69,7 +77,9 @@ type TenantModelBatchAssignRes struct {
 	Assigned int `json:"assigned"`
 }
 
-// TenantModelUpdateReq 更新租户模型分配配置
+// TenantModelUpdateReq 更新租户模型分配配置。
+// 扩展计费覆盖与展示字段用双层指针区分四态：省略=不动；null=清除恢复继承；
+// 空数组=显式关闭平台配置（时段/参数倍率）；非空=整体覆盖
 type TenantModelUpdateReq struct {
 	g.Meta                   `path:"/tenants/{tenant_id}/models/{model_id}" method:"put" mime:"json" tags:"管理后台-租户模型" summary:"更新租户模型配置"`
 	TenantID                 int64           `json:"tenant_id" in:"path" v:"required" dc:"租户ID"`
@@ -85,6 +95,14 @@ type TenantModelUpdateReq struct {
 	CustomCacheReadPrice     **float64       `json:"custom_cache_read_price" dc:"自定义缓存读取价格"`
 	CustomCacheCreationPrice **float64       `json:"custom_cache_creation_price" dc:"自定义缓存创建价格"`
 	CustomPricingTiers       *[]*PricingTier `json:"custom_pricing_tiers" dc:"自定义阶梯定价"`
+	// 扩展计费覆盖（custom_pricing 补丁三键，覆盖语义：非空整体替换平台）
+	CustomPerSecondPrices  **map[string]float64    `json:"custom_per_second_prices" dc:"按秒矩阵覆盖：省略=不动；null=清除恢复继承；非null=整体替换"`
+	CustomTimeSegments     **[]TimeSegmentItem     `json:"custom_time_segments" dc:"时段覆盖：省略=不动；null=清除恢复继承；[]=显式关闭平台时段；非空=整体替换"`
+	CustomParamMultipliers **[]ParamMultiplierItem `json:"custom_param_multipliers" dc:"参数倍率覆盖：省略=不动；null=清除恢复继承；[]=显式关闭；非空=整体替换"`
+	// 展示字段覆盖
+	PriceNote       **string `json:"price_note" dc:"价格说明覆盖（内部）：省略=不动；null=清除恢复继承"`
+	DiscountLabel   **string `json:"discount_label" dc:"折扣标签覆盖（对外）：省略=不动；null=清除恢复继承"`
+	PriceChangeNote **string `json:"price_change_note" dc:"调价说明覆盖（对外）：省略=不动；null=清除恢复继承"`
 }
 
 type TenantModelUpdateRes struct{}

@@ -82,7 +82,7 @@ func (s *sAdmin) GetDashboardStats(ctx context.Context, req *v1.AdminDashboardRe
 	var todayRow dayStatsRow
 	if err := dao.BilUsageLogs.Ctx(ctx).
 		Where("created_at >= ?", today+" 00:00:00").
-		Fields("COUNT(*) as requests, COUNT(DISTINCT tenant_id) as active_tenants, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(total_cost), 0) as total_cost, ROUND(COUNT(CASE WHEN status = 'success' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0), 2) as success_rate").
+		Fields("COUNT(*) as requests, COUNT(DISTINCT tenant_id) as active_tenants, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost, ROUND(COUNT(CASE WHEN status = 'success' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0), 2) as success_rate").
 		Scan(&todayRow); err != nil {
 		g.Log().Warningf(ctx, "GetDashboardStats: query today stats failed: %v", err)
 	}
@@ -92,7 +92,7 @@ func (s *sAdmin) GetDashboardStats(ctx context.Context, req *v1.AdminDashboardRe
 	if err := dao.BilUsageLogs.Ctx(ctx).
 		Where("created_at >= ?", yesterday+" 00:00:00").
 		Where("created_at < ?", today+" 00:00:00").
-		Fields("COUNT(*) as requests, COUNT(DISTINCT tenant_id) as active_tenants, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(total_cost), 0) as total_cost, ROUND(COUNT(CASE WHEN status = 'success' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0), 2) as success_rate").
+		Fields("COUNT(*) as requests, COUNT(DISTINCT tenant_id) as active_tenants, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost, ROUND(COUNT(CASE WHEN status = 'success' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0), 2) as success_rate").
 		Scan(&yesterdayRow); err != nil {
 		g.Log().Warningf(ctx, "GetDashboardStats: query yesterday stats failed: %v", err)
 	}
@@ -101,7 +101,7 @@ func (s *sAdmin) GetDashboardStats(ctx context.Context, req *v1.AdminDashboardRe
 	var monthRow dayStatsRow
 	if err := dao.BilUsageLogs.Ctx(ctx).
 		Where("created_at >= ?", monthStart+" 00:00:00").
-		Fields("COUNT(*) as requests, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(total_cost), 0) as total_cost").
+		Fields("COUNT(*) as requests, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost").
 		Scan(&monthRow); err != nil {
 		g.Log().Warningf(ctx, "GetDashboardStats: query month stats failed: %v", err)
 	}
@@ -193,7 +193,7 @@ func (s *sAdmin) GetDashboardTrends(ctx context.Context, req *v1.AdminDashboardT
 				DATE(created_at) as date,
 				COUNT(*) as requests,
 				COUNT(DISTINCT tenant_id) as active_tenants,
-				COALESCE(SUM(total_cost), 0) as revenue
+				COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as revenue
 			FROM bil_usage_logs
 			WHERE created_at >= ?
 			GROUP BY DATE(created_at)
@@ -222,7 +222,7 @@ func (s *sAdmin) GetTopTenants(ctx context.Context, req *v1.AdminDashboardTopTen
 			SELECT
 				t.id as tenant_id,
 				t.name as tenant_name,
-				COALESCE(SUM(ul.total_cost), 0) as total_cost,
+				COALESCE(SUM(COALESCE(NULLIF(ul.actual_cost, 0), ul.total_cost)), 0) as total_cost,
 				COUNT(*) as requests,
 				COUNT(DISTINCT ul.user_id) as active_members
 			FROM bil_usage_logs ul
@@ -257,7 +257,7 @@ func (s *sAdmin) GetModelDistribution(ctx context.Context, req *v1.AdminDashboar
 				COUNT(*) as requests,
 				COALESCE(SUM(input_tokens), 0) as input_tokens,
 				COALESCE(SUM(output_tokens), 0) as output_tokens,
-				COALESCE(SUM(total_cost), 0) as total_cost
+				COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost
 			FROM bil_usage_logs
 			WHERE created_at >= ?
 			GROUP BY model_name
@@ -298,7 +298,7 @@ func (s *sAdmin) queryModelHourlyCost(ctx context.Context, hours, topN int) (*v1
 		FROM bil_usage_logs
 		WHERE created_at >= now() - ? * interval '1 hour'
 		GROUP BY model_name
-		ORDER BY SUM(total_cost) DESC
+		ORDER BY SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)) DESC
 		LIMIT ?
 	`, hours, topN).All()
 	if err != nil {
@@ -330,7 +330,7 @@ func (s *sAdmin) queryModelHourlyCost(ctx context.Context, hours, topN int) (*v1
 			SELECT
 				date_trunc('hour', created_at) AS h,
 				`+modelExpr+` AS model,
-				SUM(total_cost) AS cost
+				SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)) AS cost
 			FROM bil_usage_logs
 			WHERE created_at >= now() - ? * interval '1 hour'
 			GROUP BY 1, 2
@@ -581,9 +581,10 @@ func (s *sAdmin) GetUsageLogSummary(ctx context.Context, req *v1.AdminUsageLogSu
 	where, args := buildUsageLogFilter(req.AdminUsageLogFilter)
 
 	// 统计聚合不展示名称，筛选条件也只引用 u.*，全程无需联表：
-	// 大表 SUM 不再背负任何 join。
+	// 大表 SUM 不再背负任何 join。费用列实扣优先（actual_cost，0/NULL 回退
+	// total_cost），与租户端同名汇总（UsageLogsSummary）口径一致
 	summarySQL := `SELECT
-		COALESCE(SUM(u.total_cost), 0) AS total_cost,
+		COALESCE(SUM(COALESCE(NULLIF(u.actual_cost, 0), u.total_cost)), 0) AS total_cost,
 		COALESCE(SUM(u.output_tokens), 0) AS total_output_tokens,
 		COALESCE(SUM(u.input_tokens), 0) AS total_input_tokens,
 		COALESCE(SUM(u.cache_read_tokens), 0) AS total_cache_read
@@ -1422,7 +1423,7 @@ func (s *sAdmin) ExportUsageLogs(ctx context.Context, req *v1.AdminUsageLogExpor
 	where, filterArgs := buildUsageLogFilter(req.AdminUsageLogFilter)
 
 	fromClause := "bil_usage_logs u LEFT JOIN tnt_users t ON u.user_id = t.id AND u.tenant_id = t.tenant_id LEFT JOIN tnt_tenants tn ON u.tenant_id = tn.id"
-	selectFields := "u.id, COALESCE(tn.name, '') AS tenant_name, COALESCE(t.username, '') AS username, u.model_name, u.request_type, u.input_tokens, u.output_tokens, u.total_cost, u.status, u.request_id, u.upstream_request_id, u.created_at"
+	selectFields := "u.id, COALESCE(tn.name, '') AS tenant_name, COALESCE(t.username, '') AS username, u.model_name, u.request_type, u.input_tokens, u.output_tokens, COALESCE(NULLIF(u.actual_cost, 0), u.total_cost) AS total_cost, u.status, u.request_id, u.upstream_request_id, u.created_at"
 
 	return nil, export.GenericExport(ctx, config, func(yield func(map[string]any) bool) {
 		// keyset（游标）翻页替代 OFFSET：OFFSET 每翻一批都要重新扫过并丢弃前面的

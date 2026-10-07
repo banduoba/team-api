@@ -30,4 +30,8 @@ type MdlTenantModels struct {
 	CustomCacheReadPrice     *decimal.Decimal // 自定义缓存读取价格（$/1M token），NULL 表示使用基础定价
 	CustomCacheCreationPrice *decimal.Decimal // 自定义缓存创建价格（$/1M token），NULL 表示使用基础定价
 	CustomPricingTiers       any              // 自定义阶梯定价（JSONB 数组），格式: [{"min_tokens":0,"max_tokens":100000,"input_price":0.5,"output_price":1.5,"cache_read_price":0.1,"cache_creation_price":0.2}]
+	CustomPricing            any              // 定价覆盖补丁（JSONB，三键）：prices 按秒矩阵 {规格:每秒单价}；time_segments 时段定价数组（[] = 显式关闭平台时段）；param_multipliers 参数倍率规则（[] = 显式关闭）。键缺失 = 继承平台定价
+	PriceNote                any              // 价格说明覆盖（仅管理后台可见），NULL 表示继承平台
+	DiscountLabel            any              // 折扣标签覆盖（对外展示），NULL 表示继承平台
+	PriceChangeNote          any              // 价格调整说明覆盖（对外展示），NULL 表示继承平台
 }

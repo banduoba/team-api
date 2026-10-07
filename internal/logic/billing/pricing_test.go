@@ -833,3 +833,104 @@ func TestResolveTokenCounts_NilTokenDetails(t *testing.T) {
 		t.Errorf("expected (1000,500,0,0,0), got (%d,%d,%d,%d,%d)", baseIn, out, cr, cc5m, cc1h)
 	}
 }
+
+// TestHasTenantCustomPrice 一口价判定：存在实际生效的自定义绝对价时折扣乘数整体跳过（防折上折）。
+// 判定按计费模式收窄——惰性字段（如 token 模式下遗留的按次单价）不构成跳过条件；
+// per_second/special 下仅覆盖按秒矩阵（补丁 prices）才构成一口价，未覆盖时倍率仍是折扣唯一手段
+func TestHasTenantCustomPrice(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	tests := []struct {
+		name  string
+		tm    *tenantModelRow
+		mode  string
+		patch *TenantPricingPatch
+		want  bool
+	}{
+		{"nil 行", nil, "token", nil, false},
+		{"空行", &tenantModelRow{}, "token", nil, false},
+		{"自定义输入价", &tenantModelRow{CustomInputPrice: f(1.8)}, "token", nil, true},
+		{"自定义输出价", &tenantModelRow{CustomOutputPrice: f(1.8)}, "token", nil, true},
+		{"自定义缓存读价", &tenantModelRow{CustomCacheReadPrice: f(0.1)}, "token", nil, true},
+		{"自定义缓存写价", &tenantModelRow{CustomCacheCreationPrice: f(0.3)}, "token", nil, true},
+		{"零值自定义价不算", &tenantModelRow{CustomInputPrice: f(0)}, "token", nil, false},
+		{"tiered 自定义阶梯", &tenantModelRow{CustomPricingTiers: `[{"min_tokens":0}]`}, "tiered", nil, true},
+		{"tiered 空阶梯", &tenantModelRow{CustomPricingTiers: "[]"}, "tiered", nil, false},
+		{"tiered null 阶梯", &tenantModelRow{CustomPricingTiers: "null"}, "tiered", nil, false},
+		{"tiered 自定义缓存价仍算", &tenantModelRow{CustomCacheReadPrice: f(0.1)}, "tiered", nil, true},
+		{"per_request 自定义按次价", &tenantModelRow{PerRequestPrice: f(0.5)}, "per_request", nil, true},
+		{"per_request 遗留 token 价忽略", &tenantModelRow{CustomInputPrice: f(2)}, "per_request", nil, false},
+		{"token 遗留按次价忽略", &tenantModelRow{PerRequestPrice: f(0.5)}, "token", nil, false},
+		{"per_second 全部忽略", &tenantModelRow{CustomInputPrice: f(2), CustomOutputPrice: f(3), CustomCacheReadPrice: f(0.1), PerRequestPrice: f(0.5)}, "per_second", nil, false},
+		{"special 全部忽略", &tenantModelRow{CustomInputPrice: f(2)}, BillingModeSpecial, nil, false},
+		{"per_second 矩阵覆盖一口价", &tenantModelRow{}, "per_second", &TenantPricingPatch{Prices: map[string]float64{"720p": 0.1, "*": 0.2}}, true},
+		{"special 矩阵覆盖一口价", &tenantModelRow{}, BillingModeSpecial, &TenantPricingPatch{Prices: map[string]float64{"*": 0.2}}, true},
+		{"per_second 仅时段覆盖不算一口价", &tenantModelRow{}, "per_second", &TenantPricingPatch{TimeSegments: &[]TimeSegment{{Name: "夜间"}}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasTenantCustomPrice(tt.tm, tt.mode, tt.patch); got != tt.want {
+				t.Errorf("hasTenantCustomPrice(%s) = %v, want %v", tt.mode, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestApplyTenantModelDiscount 租户×模型行折扣解析：优先级与屏蔽规则
+func TestApplyTenantModelDiscount(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	tests := []struct {
+		name                          string
+		tm                            *tenantModelRow
+		mode                          string
+		patch                         *TenantPricingPatch
+		wantMul, wantRatio            float64
+		wantCustomPriced, wantRatioEx bool
+	}{
+		{"nil 行", nil, "token", nil, 1, 1, false, false},
+		{"未启用行", &tenantModelRow{DiscountRatio: f(0.9)}, "token", nil, 1, 1, false, false},
+		{"全空行", &tenantModelRow{Enabled: true}, "token", nil, 1, 1, false, false},
+		{"discount_ratio 0.9", &tenantModelRow{Enabled: true, DiscountRatio: f(0.9)}, "token", nil, 0.9, 0.9, false, true},
+		{"显式 discount_ratio=1.0（不打折）", &tenantModelRow{Enabled: true, DiscountRatio: f(1.0)}, "token", nil, 1, 1, false, true},
+		{"multiplier 1.2（加价）", &tenantModelRow{Enabled: true, Multiplier: f(1.2)}, "token", nil, 1.2, 1.2, false, false},
+		{"discount_ratio 优先于 multiplier", &tenantModelRow{Enabled: true, DiscountRatio: f(0.9), Multiplier: f(1.2)}, "token", nil, 0.9, 0.9, false, true},
+		{"一口价行跳过折扣", &tenantModelRow{Enabled: true, CustomInputPrice: f(1.8), DiscountRatio: f(0.9)}, "token", nil, 1, 1, true, false},
+		{"per_second 保留 multiplier（无逐格价）", &tenantModelRow{Enabled: true, CustomInputPrice: f(2), Multiplier: f(0.8)}, "per_second", nil, 0.8, 0.8, false, false},
+		{"per_second 矩阵覆盖跳过折扣（一口价）", &tenantModelRow{Enabled: true, Multiplier: f(0.8)}, "per_second", &TenantPricingPatch{Prices: map[string]float64{"*": 0.2}}, 1, 1, true, false},
+		{"per_request 一口价（自定义按次价）", &tenantModelRow{Enabled: true, PerRequestPrice: f(0.5), DiscountRatio: f(0.9)}, "per_request", nil, 1, 1, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mul, ratio, customPriced, ratioEx := applyTenantModelDiscount(tt.tm, tt.mode, tt.patch)
+			if mul != tt.wantMul || ratio != tt.wantRatio || customPriced != tt.wantCustomPriced || ratioEx != tt.wantRatioEx {
+				t.Errorf("applyTenantModelDiscount() = (mul=%v ratio=%v customPriced=%v ratioExplicit=%v), want (%v %v %v %v)",
+					mul, ratio, customPriced, ratioEx, tt.wantMul, tt.wantRatio, tt.wantCustomPriced, tt.wantRatioEx)
+			}
+		})
+	}
+}
+
+// TestLevelFallbackApplies 等级折扣 fallback 适用判定：
+// 仅「完全未配置」的行才让等级折扣渗入
+func TestLevelFallbackApplies(t *testing.T) {
+	tests := []struct {
+		name         string
+		mul          float64
+		customPriced bool
+		ratioEx      bool
+		want         bool
+	}{
+		{"完全未配置 → 适用", 1.0, false, false, true},
+		{"已有折扣乘数 → 不适用", 0.9, false, false, false},
+		{"已有加价乘数 → 不适用", 1.2, false, false, false},
+		{"一口价 → 不适用", 1.0, true, false, false},
+		{"显式 discount_ratio → 不适用", 1.0, false, true, false},
+		{"一口价 + 显式 → 不适用", 1.0, true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := levelFallbackApplies(tt.mul, tt.customPriced, tt.ratioEx); got != tt.want {
+				t.Errorf("levelFallbackApplies(%v, %v, %v) = %v, want %v", tt.mul, tt.customPriced, tt.ratioEx, got, tt.want)
+			}
+		})
+	}
+}

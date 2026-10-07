@@ -452,7 +452,7 @@ func getModelPerfTodayFromLogs(ctx context.Context, today string, channelID int6
 			COUNT(*) FILTER (WHERE first_token_ms > 0)    AS ttft_n,
 			COALESCE(SUM(input_tokens), 0)                AS tin,
 			COALESCE(SUM(output_tokens), 0)               AS tout,
-			COALESCE(SUM(total_cost), 0)                  AS total_cost,
+			COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0)                  AS total_cost,
 			COALESCE(SUM(cache_creation_tokens), 0)       AS cache_creation,
 			COALESCE(SUM(cache_read_tokens), 0)           AS cache_read,
 			COUNT(*) FILTER (WHERE cache_read_tokens > 0) AS chit
@@ -881,7 +881,7 @@ func GetModelDistribution(ctx context.Context, minutes int) ([]map[string]any, e
 			model_name,
 			COUNT(*) as requests,
 			COALESCE(SUM(COALESCE(input_tokens,0) + COALESCE(output_tokens,0)), 0) as tokens,
-			COALESCE(SUM(total_cost), 0) as total_cost
+			COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost
 		FROM bil_usage_logs
 		WHERE created_at >= ?
 		GROUP BY model_name
@@ -910,7 +910,7 @@ func GetTenantRanking(ctx context.Context, minutes int) ([]map[string]any, error
 			t.id as tenant_id,
 			t.name as tenant_name,
 			COUNT(*) as requests,
-			COALESCE(SUM(ul.total_cost), 0) as total_cost
+			COALESCE(SUM(COALESCE(NULLIF(ul.actual_cost, 0), ul.total_cost)), 0) as total_cost
 		FROM bil_usage_logs ul
 		JOIN tnt_tenants t ON t.id = ul.tenant_id
 		WHERE ul.created_at >= ?

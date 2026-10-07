@@ -2,6 +2,7 @@ package billing
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/gogf/gf/v2/util/gconv"
 )
@@ -20,4 +21,11 @@ func formatInt(n int) string {
 // formatCost 格式化金额为 6 位小数字符串，与系统资金展示精度对齐。
 func formatCost(c float64) string {
 	return fmt.Sprintf("%.6f", c)
+}
+
+// formatMultiplier 格式化倍率：保留实际精度并去除尾部多余零（0.9 → "0.9"，1.02 → "1.02"）。
+// 用于计费摘要的乘法算式——定点两位会截断 NUMERIC(5,4) 的三四位倍率，使展示等式不成立。
+// 入参应先经 decimal 清理（buildTokenCosts 已保证），避免 float 尾差进入展示。
+func formatMultiplier(m float64) string {
+	return strconv.FormatFloat(m, 'f', -1, 64)
 }

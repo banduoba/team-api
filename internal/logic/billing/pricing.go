@@ -89,6 +89,147 @@ type PricingResult struct {
 // perSecondWildcard 矩阵兜底价键：规格未命中时使用
 const perSecondWildcard = "*"
 
+// tenantModelRow mdl_tenant_models 的计费相关列（GetModelPriceAt 查询用，
+// 提为包级类型供 hasTenantCustomPrice 纯函数判定复用）
+type tenantModelRow struct {
+	CustomInputPrice         *float64 `json:"custom_input_price"`
+	CustomOutputPrice        *float64 `json:"custom_output_price"`
+	CustomCacheReadPrice     *float64 `json:"custom_cache_read_price"`
+	CustomCacheCreationPrice *float64 `json:"custom_cache_creation_price"`
+	CustomPricingTiers       string   `json:"custom_pricing_tiers"`
+	CustomPricing            string   `json:"custom_pricing"`
+	Multiplier               *float64 `json:"multiplier"`
+	DiscountRatio            *float64 `json:"discount_ratio"`
+	BillingMode              *string  `json:"billing_mode"`
+	PerRequestPrice          *float64 `json:"per_request_price"`
+	Enabled                  bool     `json:"enabled"`
+}
+
+// TenantPricingPatch mdl_tenant_models.custom_pricing JSONB 的内存形态（覆盖补丁）。
+// 只承载三类扩展计费配置——按秒矩阵 / 时段定价 / 参数倍率；价格类覆盖仍走扁平列，
+// 避免两套真相。覆盖语义：非空即整体替换平台对应配置，未出现的键继承平台。
+// 指针切片编码三态：nil 指针（omitempty 省键）= 继承；非 nil 指向空切片 = 显式
+// 关闭平台配置（序列化为 []）；非空切片 = 整体替换。注意不可复用 PricingBlob
+// 序列化本结构——其 omitempty 会把空切片吞成缺键，丢失「显式关闭」语义
+type TenantPricingPatch struct {
+	Prices           map[string]float64 `json:"prices,omitempty"`            // 按秒矩阵：非空=整体替换（仅最终计费模式 per_second/special 时被消费）
+	TimeSegments     *[]TimeSegment     `json:"time_segments,omitempty"`     // 时段定价：nil=继承；非nil=替换（空切片=显式关闭平台时段）
+	ParamMultipliers *[]ParamRule       `json:"param_multipliers,omitempty"` // 参数倍率：nil=继承；非nil=替换（空切片=显式关闭）
+}
+
+// ParseTenantPricingPatch 解析 custom_pricing JSONB 为覆盖补丁。
+// 空串/null/解析失败返回 nil（读侧容错：坏数据不阻断计费，按全继承处理）
+func ParseTenantPricingPatch(raw string) *TenantPricingPatch {
+	if raw == "" || raw == "null" {
+		return nil
+	}
+	patch := &TenantPricingPatch{}
+	if err := json.Unmarshal([]byte(raw), patch); err != nil {
+		return nil
+	}
+	// 全空补丁视为无补丁（prices 空 map 也归一为 nil，避免 len(patch.Prices)>0 判定歧义）
+	if len(patch.Prices) == 0 && patch.TimeSegments == nil && patch.ParamMultipliers == nil {
+		return nil
+	}
+	if len(patch.Prices) == 0 {
+		patch.Prices = nil
+	}
+	return patch
+}
+
+// ApplyTenantPricingPatch 应用租户覆盖补丁：键存在的维度用租户值整体替换平台值，
+// 键缺失的维度平台值直通（继承）。GetModelPriceAt 计费读取与租户端展示链路共用，
+// 保证两侧口径一致。patch 为 nil 时三值原样返回（存量行为不变）
+func ApplyTenantPricingPatch(patch *TenantPricingPatch, prices map[string]float64,
+	segments []TimeSegment, rules []ParamRule) (map[string]float64, []TimeSegment, []ParamRule) {
+	if patch == nil {
+		return prices, segments, rules
+	}
+	if len(patch.Prices) > 0 {
+		prices = patch.Prices
+	}
+	if patch.TimeSegments != nil {
+		segments = *patch.TimeSegments
+	}
+	if patch.ParamMultipliers != nil {
+		rules = *patch.ParamMultipliers
+	}
+	return prices, segments, rules
+}
+
+// hasTenantCustomPrice 判断租户×模型行是否配置了「实际生效」的自定义绝对价（按计费模式判定）。
+// 存在时该行视为一口价：折扣乘数（discount_ratio / multiplier / 等级折扣）不再叠加，
+// 防止谈定价再被打折（折上折）。判定必须按模式收窄——惰性字段不构成跳过条件：
+//   - token：自定义输入/输出/缓存价（缓存组件在 token 模式计费）
+//   - tiered：自定义阶梯（阶梯价即绝对价）或自定义缓存价
+//   - per_request：自定义按次单价
+//   - per_second / special：覆盖了按秒矩阵（custom_pricing.prices）即一口价——
+//     矩阵整体替换平台价后是最终价，折扣不得再叠加；未覆盖矩阵时 false，
+//     multiplier/discount_ratio 仍是该模式下租户折扣的唯一手段，必须保留
+func hasTenantCustomPrice(tm *tenantModelRow, mode string, patch *TenantPricingPatch) bool {
+	if tm == nil {
+		return false
+	}
+	switch mode {
+	case "per_second", BillingModeSpecial:
+		return patch != nil && len(patch.Prices) > 0
+	case "tiered":
+		if tm.CustomPricingTiers != "" && tm.CustomPricingTiers != "null" && tm.CustomPricingTiers != "[]" {
+			return true
+		}
+	case "per_request":
+		return tm.PerRequestPrice != nil && *tm.PerRequestPrice > 0
+	}
+	if tm.CustomInputPrice != nil && *tm.CustomInputPrice > 0 {
+		return true
+	}
+	if tm.CustomOutputPrice != nil && *tm.CustomOutputPrice > 0 {
+		return true
+	}
+	if tm.CustomCacheReadPrice != nil && *tm.CustomCacheReadPrice > 0 {
+		return true
+	}
+	if tm.CustomCacheCreationPrice != nil && *tm.CustomCacheCreationPrice > 0 {
+		return true
+	}
+	return false
+}
+
+// applyTenantModelDiscount 租户×模型行折扣解析（纯函数，GetModelPriceAt 调用，便于单测）。
+// 返回 (tenantMultiplier, discountRatio, customPriced, ratioExplicit)：
+//   - 一口价行（hasTenantCustomPrice）整体跳过折扣，customPriced=true 供等级 fallback 屏蔽
+//   - discount_ratio 优先于 multiplier
+//   - ratioExplicit 标记显式配置过 discount_ratio（含 =1.0——可空列，nil 才是「未设置」），
+//     供等级 fallback 屏蔽：明确表达「不打折」的行不得被等级折扣渗入
+func applyTenantModelDiscount(tm *tenantModelRow, mode string, patch *TenantPricingPatch) (tenantMultiplier, discountRatio float64, customPriced, ratioExplicit bool) {
+	tenantMultiplier, discountRatio = 1.0, 1.0
+	if tm == nil || !tm.Enabled {
+		return
+	}
+	customPriced = hasTenantCustomPrice(tm, mode, patch)
+	if customPriced {
+		return
+	}
+	if tm.DiscountRatio != nil {
+		ratioExplicit = true
+		if *tm.DiscountRatio > 0 {
+			discountRatio = *tm.DiscountRatio
+			tenantMultiplier = *tm.DiscountRatio
+		}
+	} else if tm.Multiplier != nil && *tm.Multiplier > 0 {
+		tenantMultiplier = *tm.Multiplier
+		discountRatio = *tm.Multiplier
+	}
+	return
+}
+
+// levelFallbackApplies 等级折扣 fallback 适用判定（纯函数）：
+// 仅当租户×模型维度完全未配置折扣——乘数仍为 1.0、非一口价、未显式配置 discount_ratio——
+// 等级折扣才作为兜底生效。等级乘数的取值过滤见 GetLevelPriceMultiplier（仅 (0,1)）。
+func levelFallbackApplies(tenantMultiplier float64, customPriced, ratioExplicit bool) bool {
+	return tenantMultiplier == 1.0 && !customPriced && !ratioExplicit
+}
+
 // BillingModeSpecial 特殊计费模式（与 per_second 平级）：仅由特殊计费方案使用，
 // pricing JSONB 顶层必须同时声明 scheme 键（写侧双向配对校验）。计费分发只看
 // Scheme 不看此值，它用于展示层区分「按秒计费」与「特殊方案组合计费」，
@@ -158,6 +299,37 @@ func ClearTenantPriceCache(ctx context.Context, tenantID int64) {
 // 缓存键格式为 {tenantID}:{modelName}，此处按模型名匹配所有租户的条目。
 func ClearModelPriceCache(ctx context.Context, modelName string) {
 	modelPriceCache.DeleteByPattern(ctx, fmt.Sprintf("*:%s", modelName))
+}
+
+// ClearTenantPriceCacheAll 清除租户的全部模型价格缓存（{tenantID}:* 模式匹配，含分组来源模型）。
+// ClearTenantPriceCache 只清显式分配的模型（按 mdl_tenant_models 逐个删键）；
+// 等级/折扣类变更影响该租户的全部模型（分组模型定价同样烘焙了租户乘数），必须全量清除。
+func ClearTenantPriceCacheAll(ctx context.Context, tenantID int64) {
+	modelPriceCache.DeleteByPattern(ctx, fmt.Sprintf("%d:*", tenantID))
+}
+
+// ClearLevelPriceCache 清除指定等级下所有租户的价格缓存（等级折扣配置变更后调用，
+// 含 create/delete：等级号可能被存量租户持有——删配置不清租户级别值，重建配置后
+// 折扣恢复/消失需即时反映）。不清除则旧折扣在 600s 定价缓存 TTL 内继续生效。
+func ClearLevelPriceCache(ctx context.Context, level int) {
+	var tenants []struct {
+		Id int64 `json:"id"`
+	}
+	if err := dao.TntTenants.Ctx(ctx).Where("level", level).Fields("id").Scan(&tenants); err != nil {
+		g.Log().Warningf(ctx, "[Billing] clear level price cache: query tenants of level %d failed: %v", level, err)
+		return
+	}
+	for _, t := range tenants {
+		modelPriceCache.DeleteByPattern(ctx, fmt.Sprintf("%d:*", t.Id))
+	}
+}
+
+// InvalidateTenantLevelCaches 租户等级变化后的缓存失效：价格缓存（等级折扣随之变化）
+// + 并发限制缓存（未自定义时并发上限跟随等级配置）。自动升级（CheckAndUpgradeLevel）
+// 与管理员手动调级（admin UpdateTenant）共用，保证两条路径行为一致。
+func InvalidateTenantLevelCaches(ctx context.Context, tenantID int64) {
+	ClearTenantPriceCacheAll(ctx, tenantID)
+	_, _ = g.Redis().Do(ctx, "DEL", fmt.Sprintf("tenant:conc_limit:%d", tenantID))
 }
 
 // GetModelPrice 获取模型价格（时段乘数按当前时刻评估）。
@@ -271,33 +443,21 @@ func GetModelPriceAt(ctx context.Context, tenantID int64, modelName string, bill
 	}
 
 	// 3. 查租户独立价格（mdl_tenant_models）
-	type tenantModelRow struct {
-		CustomInputPrice         *float64 `json:"custom_input_price"`
-		CustomOutputPrice        *float64 `json:"custom_output_price"`
-		CustomCacheReadPrice     *float64 `json:"custom_cache_read_price"`
-		CustomCacheCreationPrice *float64 `json:"custom_cache_creation_price"`
-		CustomPricingTiers       string   `json:"custom_pricing_tiers"`
-		Multiplier               *float64 `json:"multiplier"`
-		DiscountRatio            *float64 `json:"discount_ratio"`
-		BillingMode              *string  `json:"billing_mode"`
-		PerRequestPrice          *float64 `json:"per_request_price"`
-		Enabled                  bool     `json:"enabled"`
-	}
-
 	var tm *tenantModelRow
 	err = dao.MdlTenantModels.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("model_id", model.ID).
-		Fields("custom_input_price, custom_output_price, custom_cache_read_price, custom_cache_creation_price, custom_pricing_tiers, multiplier, discount_ratio, billing_mode, per_request_price, enabled").
+		Fields("custom_input_price, custom_output_price, custom_cache_read_price, custom_cache_creation_price, custom_pricing_tiers, custom_pricing, multiplier, discount_ratio, billing_mode, per_request_price, enabled").
 		Scan(&tm)
 	if err != nil {
 		return nil, gerror.Wrapf(err, "query tenant model price")
 	}
 
-	tenantMultiplier := 1.0
-	discountRatio := 1.0
 	billingSource := "base"
 	var customTiers []pricingTierRow
+	// 租户定价覆盖补丁（custom_pricing JSONB：按秒矩阵/时段/参数倍率），
+	// 在价格覆盖之后应用——键存在的维度整体替换平台值，缺失的维度继承
+	var patch *TenantPricingPatch
 
 	if tm != nil && tm.Enabled {
 		billingSource = "tenant_custom"
@@ -328,20 +488,21 @@ func GetModelPriceAt(ctx context.Context, tenantID int64, modelName string, bill
 			_ = json.Unmarshal([]byte(tm.CustomPricingTiers), &customTiers)
 		}
 
-		// discount_ratio 优先于 multiplier
-		if tm.DiscountRatio != nil && *tm.DiscountRatio > 0 {
-			discountRatio = *tm.DiscountRatio
-			tenantMultiplier = *tm.DiscountRatio
-		} else if tm.Multiplier != nil && *tm.Multiplier > 0 {
-			tenantMultiplier = *tm.Multiplier
-			discountRatio = *tm.Multiplier
-		}
-
 		// 租户覆盖按次单价
 		if tm.PerRequestPrice != nil && *tm.PerRequestPrice > 0 {
 			perRequestPrice = *tm.PerRequestPrice
 		}
+
+		// 扩展计费配置覆盖（补丁解析在价格覆盖后、折扣解析前——hasTenantCustomPrice
+		// 的一口价判定要消费矩阵覆盖状态）。覆盖后的局部变量进入 PricingResult 组装，
+		// 下游计费引擎/快照/时段评估自动生效
+		patch = ParseTenantPricingPatch(tm.CustomPricing)
+		perSecondPrices, timeSegments, paramMultipliers = ApplyTenantPricingPatch(patch, perSecondPrices, timeSegments, paramMultipliers)
 	}
+
+	// 折扣乘数解析（纯函数，见 applyTenantModelDiscount）：一口价行整体跳过、
+	// discount_ratio 优先于 multiplier；billingMode 已含租户级模式覆盖（resolved）
+	tenantMultiplier, discountRatio, customPriced, ratioExplicit := applyTenantModelDiscount(tm, billingMode, patch)
 
 	// 2.5 平台阶梯兜底：租户未自定义阶梯时使用平台阶梯（pricing JSONB tiers 数组）。
 	// 计费模式非 tiered 时 computeCost 不会读取 CustomTiers，无副作用
@@ -349,8 +510,9 @@ func GetModelPriceAt(ctx context.Context, tenantID int64, modelName string, bill
 		customTiers = platformTiers
 	}
 
-	// 3.5 级别折扣 fallback：当租户×模型维度未设置倍率时，使用租户级别的 price_multiplier
-	if tenantMultiplier == 1.0 {
+	// 3.5 级别折扣 fallback：仅当租户×模型维度完全未配置折扣时使用租户级别的
+	// price_multiplier（适用判定见 levelFallbackApplies，等级值过滤见 GetLevelPriceMultiplier）
+	if levelFallbackApplies(tenantMultiplier, customPriced, ratioExplicit) {
 		levelMultiplier := GetLevelPriceMultiplier(ctx, tenantID)
 		levelMultiplierFloat := InexactFloat64(levelMultiplier)
 		if levelMultiplierFloat > 0 && levelMultiplierFloat < 1.0 {
@@ -590,6 +752,10 @@ type CostBreakdown struct {
 	CacheReadTokens     int
 	CacheCreationCost   float64
 	CacheReadCost       float64
+
+	// TaskFacts 任务计费要素明细（仅任务结算路径填充：附加乘数清单、参数倍率命中、
+	// 按秒命中明细），随快照留痕供账单复算；同步对话路径恒为 nil
+	TaskFacts *TaskBillingFacts
 }
 
 // EstimatePreDeductAmount 估算预扣金额
@@ -778,7 +944,8 @@ func ParsePricingBlob(raw string) *PricingBlob {
 // 设计约束（docs/模型定价存储JSON化与按秒计费设计.md）：
 //   - 数值一律 float64 number（禁止 decimal 直接 marshal 进 JSONB——会变带引号字符串）；
 //   - time_segments 并入顶层（横切所有模式）；
-//   - 租户覆盖不逐格配：mdl_tenant_models.multiplier 作用于整个矩阵。
+//   - 租户覆盖分两层：价格类走 mdl_tenant_models 扁平列；按秒矩阵/时段/参数倍率走
+//     custom_pricing 覆盖补丁（见 TenantPricingPatch），覆盖矩阵后折扣不再叠加（一口价）。
 type PricingBlob struct {
 	// token 模式
 	InputPrice         *float64 `json:"input_price,omitempty"`

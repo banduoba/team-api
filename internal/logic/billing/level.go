@@ -110,7 +110,9 @@ func GetTenantLevelConfig(ctx context.Context, level int) (*entity.TntTenantLeve
 }
 
 // GetLevelPriceMultiplier 获取租户级别的价格乘数（decimal 原生版）
-// 查询失败时静默返回 1.0，不阻断计费
+// 查询失败时静默返回 1.0，不阻断计费。
+// 仅 (0,1) 内的值视为有效折扣：等级乘数语义为折扣（列注释「如 0.9=九折」），
+// >1 的加价与 API/管理端校验口径一致地不支持——存量库中的 >1 值防御性归一为 1.0
 func GetLevelPriceMultiplier(ctx context.Context, tenantID int64) decimal.Decimal {
 	var tenant *entity.TntTenants
 	if err := dao.TntTenants.Ctx(ctx).Where("id", tenantID).Scan(&tenant); err != nil || tenant == nil {
@@ -128,7 +130,7 @@ func GetLevelPriceMultiplier(ctx context.Context, tenantID int64) decimal.Decima
 		return One
 	}
 
-	if config.PriceMultiplier.GreaterThan(Zero) && !config.PriceMultiplier.Equal(One) {
+	if config.PriceMultiplier.GreaterThan(Zero) && config.PriceMultiplier.LessThan(One) {
 		return config.PriceMultiplier
 	}
 	return One
@@ -207,11 +209,8 @@ func CheckAndUpgradeLevel(ctx context.Context, tenantID int64) error {
 		return err
 	}
 
-	// 7. 清除并发限制缓存
-	_, _ = g.Redis().Do(ctx, "DEL", fmt.Sprintf("tenant:conc_limit:%d", tenantID))
-
-	// 8. 清除该租户的价格缓存（级别变化可能影响折扣）
-	modelPriceCache.DeleteByPattern(ctx, fmt.Sprintf("%d:*", tenantID))
+	// 7. 清除该租户的价格缓存与并发限制缓存（级别变化影响折扣与并发上限）
+	InvalidateTenantLevelCaches(ctx, tenantID)
 
 	return nil
 }

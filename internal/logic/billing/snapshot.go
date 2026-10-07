@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 
 	rcommon "github.com/qianfree/team-api/relay/common"
 )
@@ -16,6 +18,21 @@ type BillingSnapshot struct {
 	TokenCosts  map[string]TokenCostDetail  `json:"token_costs"`
 	Settlement  BillingSnapshotSettlement   `json:"settlement"`
 	RequestMeta BillingSnapshotRequestMeta  `json:"request_meta"`
+	// PerSecond 按秒/方案计费的命中明细（仅任务结算路径、按秒矩阵参与定价时填充）：
+	// 记录实际计费秒数、命中档位与单价，配合 multipliers 使
+	// 「秒数 × 档位单价 × 乘数链 ≈ 实际费用」可复算；特殊方案含素材组件时该节描述输出生成组件
+	PerSecond *BillingSnapshotPerSecond `json:"per_second,omitempty"`
+}
+
+// BillingSnapshotPerSecond 按秒计费命中明细
+type BillingSnapshotPerSecond struct {
+	// Resolution 命中的矩阵键（官方 usage 实际分辨率优先，回退提交时请求档位；
+	// 空 = 矩阵未按档位配置，经通配/最低价兜底查价）
+	Resolution string `json:"resolution,omitempty"`
+	// Seconds 计费秒数（官方 usage 实际秒数优先——智能时长模式下可能与请求时长不同，回退请求时长）
+	Seconds float64 `json:"seconds"`
+	// UnitPrice 命中的每秒单价（本位币）
+	UnitPrice float64 `json:"unit_price"`
 }
 
 // BillingSnapshotPricing 价格来源信息
@@ -32,6 +49,9 @@ type BillingSnapshotPricing struct {
 	// PerSecondPrices 按秒单价矩阵（仅 per_second / special 模式填充，其余模式 omitted）：
 	// special 的矩阵是输出生成组件的定价依据，快照携带供账单解释
 	PerSecondPrices map[string]float64 `json:"per_second_prices,omitempty"`
+	// PerRequestPrice 按次单价（仅 per_request 模式填充）：摘要的「按次单价」行取此值。
+	// 此前误用 EffectiveInputPrice（token 输入价，纯按次模型恒为 0，展示「按次单价: $0」）
+	PerRequestPrice float64 `json:"per_request_price,omitempty"`
 }
 
 // BillingSnapshotMultipliers 倍率信息
@@ -42,6 +62,13 @@ type BillingSnapshotMultipliers struct {
 	RateMultiplier   float64 `json:"rate_multiplier"`
 	TimeMultiplier   float64 `json:"time_multiplier"` // 时段乘数（未启用时段定价时为 1）
 	TimeRule         string  `json:"time_rule"`       // 命中的时段名（供账单解释；未命中为空）
+	// RatioMultipliers 计费上下文实际应用的附加乘数（任务路径：video_input 折扣、quality、
+	// duration_multiplier、param_multiplier 等；与实际乘法链一致，乘数=1 也如实列出）。
+	// 缺失该清单时「数量 × 单价 × 租户/时段倍率 = 费用」在附加乘数 ≠ 1 时无法复算。
+	// 同步对话路径无 ratios，omitempty 省略；旧快照无此字段，读取方按空处理
+	RatioMultipliers map[string]float64 `json:"ratio_multipliers,omitempty"`
+	// ParamMatched 参数倍率命中的规则说明（param_matched，| 分隔），解释 param_multiplier 来源
+	ParamMatched string `json:"param_matched,omitempty"`
 }
 
 // BillingSnapshotCachePrices 缓存价格信息
@@ -54,7 +81,13 @@ type BillingSnapshotCachePrices struct {
 type TokenCostDetail struct {
 	Tokens    int     `json:"tokens"`
 	UnitPrice float64 `json:"unit_price"`
-	Cost      float64 `json:"cost"`
+	// Multiplier 该分项已乘的综合倍率（租户倍率 × 时段乘数）。
+	// Cost 是已乘倍率的实际费用而 UnitPrice 是未乘倍率的原价，二者口径不同：
+	// 缺少该字段时「tokens/1M × unit_price = cost」表面不成立（折上折观感），
+	// 写入后完整算式 tokens/1M × unit_price × multiplier = cost 可自洽复算。
+	// 恰为 1（无折扣）时 omitempty 省略；旧快照无此字段，读取方按 1 处理。
+	Multiplier float64 `json:"multiplier,omitempty"`
+	Cost       float64 `json:"cost"`
 }
 
 // BillingSnapshotSettlement 结算信息
@@ -96,6 +129,7 @@ func GenerateBillingSnapshot(
 			BillingSource:        pricing.BillingSource,
 			Scheme:               pricing.Scheme,
 			PerSecondPrices:      pricing.PerSecondPrices,
+			PerRequestPrice:      pricing.PerRequestPrice,
 		},
 		Multipliers: BillingSnapshotMultipliers{
 			ModelMultiplier:  pricing.ModelMultiplier,
@@ -106,6 +140,19 @@ func GenerateBillingSnapshot(
 			TimeRule:         pricing.TimeRuleName,
 		},
 		TokenCosts: buildTokenCosts(pricing, breakdown),
+	}
+
+	// 任务计费要素（仅任务结算路径填充）：附加乘数清单 + 按秒命中明细随快照留痕
+	if breakdown.TaskFacts != nil {
+		snapshot.Multipliers.RatioMultipliers = breakdown.TaskFacts.AppliedRatios
+		snapshot.Multipliers.ParamMatched = breakdown.TaskFacts.ParamMatched
+		if breakdown.TaskFacts.PerSecond != nil {
+			snapshot.PerSecond = &BillingSnapshotPerSecond{
+				Resolution: breakdown.TaskFacts.PerSecond.Resolution,
+				Seconds:    breakdown.TaskFacts.PerSecond.Seconds,
+				UnitPrice:  breakdown.TaskFacts.PerSecond.UnitPrice,
+			}
+		}
 	}
 
 	// Cache 比率（仅当有 cache token 时填充）
@@ -145,37 +192,45 @@ func GenerateBillingSnapshot(
 	return snapshot
 }
 
-// buildTokenCosts 构建各类 token 的费用明细
+// buildTokenCosts 构建各类 token 的费用明细。
+// Cost 分项为已乘综合倍率的实际费用（与 computeCost 的 InputCost/OutputCost 口径一致），
+// Multiplier 随行写入使「tokens/1M × unit_price × multiplier = cost」可自洽复算。
+// 任务路径的费用含 ratios 附加乘数（video_input 折扣等，经 RecalculateByTokens），
+// 乘数链必须把附加乘数一并纳入，否则算式两边在附加乘数 ≠ 1 时不相等。
 func buildTokenCosts(pricing *PricingResult, breakdown *CostBreakdown) map[string]TokenCostDetail {
-	costs := make(map[string]TokenCostDetail)
-
-	costs["input"] = TokenCostDetail{
-		Tokens:    breakdown.InputTokens,
-		UnitPrice: pricing.InputPrice,
-		Cost:      breakdown.InputCost,
+	// decimal 相乘后回转 float64：避免 0.85×1.2 在 IEEE double 下产生
+	// 1.0199999999999998 类尾差进入快照与展示算式
+	mulD := NewFromFloat(pricing.TenantMultiplier).Mul(NewFromFloat(effectiveTimeMultiplier(pricing)))
+	// 附加乘数按键名排序后连乘：map 迭代序不确定，排序保证快照数值跨次一致
+	if breakdown.TaskFacts != nil && len(breakdown.TaskFacts.AppliedRatios) > 0 {
+		keys := make([]string, 0, len(breakdown.TaskFacts.AppliedRatios))
+		for k := range breakdown.TaskFacts.AppliedRatios {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			mulD = mulD.Mul(NewFromFloat(breakdown.TaskFacts.AppliedRatios[k]))
+		}
 	}
-	costs["output"] = TokenCostDetail{
-		Tokens:    breakdown.OutputTokens,
-		UnitPrice: pricing.OutputPrice,
-		Cost:      breakdown.OutputCost,
+	mul := InexactFloat64(mulD)
+
+	detail := func(tokens int, unitPrice, cost float64) TokenCostDetail {
+		return TokenCostDetail{Tokens: tokens, UnitPrice: unitPrice, Multiplier: mul, Cost: cost}
+	}
+
+	costs := map[string]TokenCostDetail{
+		"input":  detail(breakdown.InputTokens, pricing.InputPrice, breakdown.InputCost),
+		"output": detail(breakdown.OutputTokens, pricing.OutputPrice, breakdown.OutputCost),
 	}
 
 	if breakdown.CacheReadTokens > 0 {
 		// direct cache price
-		costs["cache_read"] = TokenCostDetail{
-			Tokens:    breakdown.CacheReadTokens,
-			UnitPrice: pricing.CacheReadPrice,
-			Cost:      breakdown.CacheReadCost,
-		}
+		costs["cache_read"] = detail(breakdown.CacheReadTokens, pricing.CacheReadPrice, breakdown.CacheReadCost)
 	}
 
 	if breakdown.CacheCreationTokens > 0 {
 		// direct cache creation price
-		costs["cache_creation"] = TokenCostDetail{
-			Tokens:    breakdown.CacheCreationTokens,
-			UnitPrice: pricing.CacheCreationPrice,
-			Cost:      breakdown.CacheCreationCost,
-		}
+		costs["cache_creation"] = detail(breakdown.CacheCreationTokens, pricing.CacheCreationPrice, breakdown.CacheCreationCost)
 	}
 
 	return costs
@@ -233,69 +288,89 @@ func GenerateBillingSummary(ctx context.Context, snapshot *BillingSnapshot) stri
 
 	// 按次计费特殊处理
 	if snapshot.Pricing.BillingMode == "per_request" {
-		lines = append(lines, fmt.Sprintf("按次单价: %s%.6f", sym, snapshot.Pricing.EffectiveInputPrice))
+		// 按次单价取 PerRequestPrice（此前误用 EffectiveInputPrice = token 输入价，
+		// 纯按次模型恒为 0，摘要展示「按次单价: $0.000000」）
+		lines = append(lines, fmt.Sprintf("按次单价: %s", money(snapshot.Pricing.PerRequestPrice)))
 	} else {
-		// 各类 token 费用明细
-		if tc, ok := snapshot.TokenCosts["input"]; ok && tc.Tokens > 0 {
-			lines = append(lines, fmt.Sprintf("输入: %s tokens × %s/1M = %s",
-				formatInt(tc.Tokens), money(tc.UnitPrice), money(tc.Cost)))
+		// 各类 token 费用明细：tokens × 原价/1M × 倍率 = 实际费用。
+		// Cost 分项已含折扣（computeCost 分项 × mul），倍率必须显式进入算式，
+		// 否则「原价单价 = 折后费用」表面不成立；无折扣时省略倍率段。
+		// 任务路径的行倍率含 ratios 附加乘数（buildTokenCosts 已并入乘数链）
+		tokenRows := []struct {
+			label string
+			key   string
+		}{
+			{"输入", "input"},
+			{"输出", "output"},
+			{"缓存读取", "cache_read"},
+			{"缓存创建", "cache_creation"},
 		}
-		if tc, ok := snapshot.TokenCosts["output"]; ok && tc.Tokens > 0 {
-			lines = append(lines, fmt.Sprintf("输出: %s tokens × %s/1M = %s",
-				formatInt(tc.Tokens), money(tc.UnitPrice), money(tc.Cost)))
-		}
-		if tc, ok := snapshot.TokenCosts["cache_read"]; ok && tc.Tokens > 0 {
-			lines = append(lines, fmt.Sprintf("缓存读取: %s tokens × %s/1M = %s",
-				formatInt(tc.Tokens), money(tc.UnitPrice), money(tc.Cost)))
-		}
-		if tc, ok := snapshot.TokenCosts["cache_creation"]; ok && tc.Tokens > 0 {
-			lines = append(lines, fmt.Sprintf("缓存创建: %s tokens × %s/1M = %s",
-				formatInt(tc.Tokens), money(tc.UnitPrice), money(tc.Cost)))
-		}
-
-		// 小计 × 倍率：展开各项费用明细，乘法链 = 租户倍率 × 时段乘数
-		effTenant := snapshot.Multipliers.TenantMultiplier
-		effTime := snapshot.Multipliers.TimeMultiplier
-		if effTime <= 0 {
-			effTime = 1.0
-		}
-		if effTenant > 0 && (effTenant != 1.0 || effTime != 1.0) {
-			// 收集各项费用明细
-			var costParts []string
-			if tc, ok := snapshot.TokenCosts["input"]; ok && tc.Cost > 0 {
+		var costParts []string
+		for _, row := range tokenRows {
+			tc, ok := snapshot.TokenCosts[row.key]
+			if !ok || tc.Tokens <= 0 {
+				continue
+			}
+			multPart := ""
+			if tc.Multiplier > 0 && tc.Multiplier != 1.0 {
+				multPart = fmt.Sprintf(" × %s", formatMultiplier(tc.Multiplier))
+			}
+			lines = append(lines, fmt.Sprintf("%s: %s tokens × %s/1M%s = %s",
+				row.label, formatInt(tc.Tokens), money(tc.UnitPrice), multPart, money(tc.Cost)))
+			if tc.Cost > 0 {
 				costParts = append(costParts, money(tc.Cost))
 			}
-			if tc, ok := snapshot.TokenCosts["output"]; ok && tc.Cost > 0 {
-				costParts = append(costParts, money(tc.Cost))
-			}
-			if tc, ok := snapshot.TokenCosts["cache_read"]; ok && tc.Cost > 0 {
-				costParts = append(costParts, money(tc.Cost))
-			}
-			if tc, ok := snapshot.TokenCosts["cache_creation"]; ok && tc.Cost > 0 {
-				costParts = append(costParts, money(tc.Cost))
-			}
-
-			// 构建倍率描述（租户倍率和时段乘数是并列关系，带文字标签）
-			multDesc := fmt.Sprintf("租户倍率(%.2f)", effTenant)
-			if effTime != 1.0 {
-				multDesc += fmt.Sprintf(" × 时段乘数(%.2f)", effTime)
-			}
-
-			// 展开格式：(abc + def + feg) × 倍率 = 总计；无逐项明细时按实际费用反推展示基数（仅用于展示，不影响实际计费）
-			costsExpr := ""
-			if len(costParts) > 1 {
-				costsExpr = fmt.Sprintf("(%s)", joinWithPlus(costParts))
-			} else if len(costParts) == 1 {
-				costsExpr = costParts[0]
-			} else if snapshot.Settlement.ActualCost > 0 {
-				costsExpr = money(snapshot.Settlement.ActualCost / (effTenant * effTime))
-			}
-
-			if costsExpr != "" {
-				lines = append(lines, fmt.Sprintf("小计: %s × %s = %s",
-					costsExpr, multDesc, money(snapshot.Settlement.ActualCost)))
-			}
 		}
+		if len(costParts) > 1 {
+			lines = append(lines, fmt.Sprintf("合计: (%s) = %s",
+				joinWithPlus(costParts), money(snapshot.Settlement.ActualCost)))
+		}
+	}
+
+	// 按秒计费命中明细行（仅任务结算路径且按秒矩阵参与定价时快照携带）：
+	// 展示实际计费秒数与命中档位单价。秒数以官方素材计量为准（智能时长模式下与请求时长不同），
+	// 是按秒计费的核心计价依据；费用 = 秒数 × 单价 × 下方乘数链（特殊方案另有素材组件，见计费方案行）
+	if snapshot.PerSecond != nil {
+		specPart := ""
+		if snapshot.PerSecond.Resolution != "" {
+			specPart = fmt.Sprintf("（档位 %s）", snapshot.PerSecond.Resolution)
+		}
+		lines = append(lines, fmt.Sprintf("按秒计费: %s 秒 × %s/秒%s",
+			formatMultiplier(snapshot.PerSecond.Seconds), money(snapshot.PerSecond.UnitPrice), specPart))
+	}
+
+	// 倍率说明行（所有计费模式通用）：租户/时段/附加乘数逐项列出，任一 ≠ 1 或存在附加乘数时展示。
+	// 分项费用已含全部乘数，合计 = 各分项之和 = 实际费用；此行解释乘数构成，
+	// 缺失附加乘数（video_input 折扣、param_multiplier 等）时算式无法复算。
+	// 不再展示「(分项之和) × 倍率 = 实际」——旧格式的分项是折后值，再乘倍率
+	// 呈现折上折观感，算式两边对不上（分项之和本就等于实际费用）
+	effTenant := snapshot.Multipliers.TenantMultiplier
+	effTime := snapshot.Multipliers.TimeMultiplier
+	if effTime <= 0 {
+		effTime = 1.0
+	}
+	// 附加乘数按键名排序：map 迭代序不确定，排序保证摘要文本跨次一致（快照可重放）
+	ratioKeys := make([]string, 0, len(snapshot.Multipliers.RatioMultipliers))
+	for k := range snapshot.Multipliers.RatioMultipliers {
+		ratioKeys = append(ratioKeys, k)
+	}
+	sort.Strings(ratioKeys)
+	if (effTenant > 0 && effTenant != 1.0) || effTime != 1.0 || len(ratioKeys) > 0 {
+		var parts []string
+		if effTenant > 0 && effTenant != 1.0 {
+			parts = append(parts, fmt.Sprintf("租户倍率(%s)", formatMultiplier(effTenant)))
+		}
+		if effTime != 1.0 {
+			parts = append(parts, fmt.Sprintf("时段乘数(%s)", formatMultiplier(effTime)))
+		}
+		for _, k := range ratioKeys {
+			factor := fmt.Sprintf("%s(%s)", k, formatMultiplier(snapshot.Multipliers.RatioMultipliers[k]))
+			if k == ratioKeyParamMultiplier && snapshot.Multipliers.ParamMatched != "" {
+				factor += fmt.Sprintf("（%s）", snapshot.Multipliers.ParamMatched)
+			}
+			parts = append(parts, factor)
+		}
+		lines = append(lines, "已应用倍率: "+strings.Join(parts, " × "))
 	}
 
 	// 时段定价行：放在 token/per_request 分支之后统一展示，保证账单可解释（按次计费同样适用时段乘数）

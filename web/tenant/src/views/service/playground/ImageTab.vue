@@ -208,6 +208,8 @@ interface AsyncTask {
 }
 const asyncTask = ref<AsyncTask | null>(null)
 const polling = ref(false)
+// 本次生成起点（ms）：结果占位卡右上角计时用；跨「提交中 → 轮询中」两个占位阶段连续计时
+const genStartAt = ref<number | null>(null)
 // 任务状态轮询：页面隐藏时暂停（任务在服务端继续执行），恢复可见时立即补拉
 const taskPoller = createPoller(pollLoop, 3000, { immediate: true })
 // 轮询上限：100 次实际轮询 ≈ 5 分钟（页面隐藏期间不计数），超过判定超时，防止无限轮询。
@@ -271,6 +273,7 @@ function buildBody(): Record<string, any> {
 async function generate() {
 	if (!prompt.value.trim() || !selectedModel.value) return
 	sending.value = true
+	genStartAt.value = Date.now()
 	errorMessage.value = ''
 	fallbackNotice.value = ''
 	images.value = []
@@ -326,8 +329,10 @@ async function submitAsync(api: ReturnType<typeof createPlaygroundApi>, body: Re
 }
 
 // generateSync 走同步端点：阻塞一次性返回图片与用量。
+// 超时 600s 与后端图片模式强制下限（relay ImagesGenerationTimeoutSecs）对齐：
+// b64_json 响应体达 MB 级，慢网络下载耗时会远超生成耗时，前端超时须不早于后端放弃。
 async function generateSync(api: ReturnType<typeof createPlaygroundApi>, body: Record<string, any>) {
-	const res = await api.post('/v1/images/generations', body, { timeout: 300_000 })
+	const res = await api.post('/v1/images/generations', body, { timeout: 600_000 })
 	const data = res.data
 	images.value = data.data || []
 	const usage = data.usage || {}
@@ -640,6 +645,7 @@ function closeZoom() {
 							v-if="sending"
 							kind="image"
 							:label="effectiveMode === 'async' ? '正在提交生成任务...' : '图片生成中...'"
+							:since="genStartAt"
 						/>
 
 						<!-- 异步任务进行中：卡片式进度占位（成功由下方图片区接管） -->
@@ -649,6 +655,7 @@ function closeZoom() {
 							:progress="asyncTask.progress"
 							:label="statusLabel[asyncTask.status] || asyncTask.status"
 							:sublabel="asyncTask.id ? 'task_id: ' + asyncTask.id : ''"
+							:since="genStartAt"
 						/>
 
 						<!-- 任务失败 -->

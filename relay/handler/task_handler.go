@@ -178,7 +178,13 @@ func HandleTaskSubmit(
 	// 4. 构建 RelayInfo
 	relayMode := rc.RelayMode
 	if relayMode == 0 {
-		relayMode = int(constant.RelayModeVideoGenerations)
+		// 入口未显式指定时按请求路径推导（/v1/video/generations、/suno/submit/* 等共用本管线），
+		// 推导不出回退视频模式保持既有行为。relay_mode 随任务持久化，终态结算写用量日志时还原
+		if m := constant.Path2RelayMode(path); m != constant.RelayModeUnknown {
+			relayMode = int(m)
+		} else {
+			relayMode = int(constant.RelayModeVideoGenerations)
+		}
 	}
 
 	// 渠道调试日志：开关开启且匹配目标过滤时创建会话（捕获段1 + 包装段4 writer），
@@ -330,6 +336,9 @@ func HandleTaskSubmit(
 	privateDataMap := map[string]any{
 		"upstream_task_id": upstreamTaskID,
 		"task_type":        platform,
+		// 入站 relay 模式随任务持久化：结算写用量日志时还原（/v1/videos、/suno、图片异步端点
+		// 共用任务管线，终态离线结算时已无 HTTP 上下文可查）
+		"relay_mode": relayMode,
 		"billing_context": map[string]any{
 			"ratios":     finalRatios,
 			"model_name": modelName,

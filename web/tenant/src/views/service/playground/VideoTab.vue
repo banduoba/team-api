@@ -143,6 +143,8 @@ interface TaskInfo {
 }
 const currentTask = ref<TaskInfo | null>(null)
 const polling = ref(false)
+// 本次生成起点（ms）：结果占位卡右上角计时用；跨「提交中 → 排队/生成中」连续计时
+const genStartAt = ref<number | null>(null)
 
 // 结果卡右上角的状态徽标配色
 const statusBadgeClass = computed(() => {
@@ -172,6 +174,7 @@ function applyResolutionPreset(val: string) {
 async function submitTask() {
 	if (!prompt.value.trim() || !selectedModel.value) return
 	submitting.value = true
+	genStartAt.value = Date.now()
 	currentTask.value = null
 	deferredNames.value = []
 	stopPolling()
@@ -457,6 +460,7 @@ function downloadVideo() {
 							:progress="submitting ? '' : currentTask?.progress"
 							:label="submitting ? '正在提交生成任务...' : (statusLabel[currentTask!.status] || currentTask!.status)"
 							:sublabel="!submitting && currentTask?.id ? 'task_id: ' + currentTask.id : ''"
+							:since="genStartAt"
 						/>
 
 						<!-- 任务状态 -->

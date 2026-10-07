@@ -189,6 +189,26 @@ func (p *AsyncProvider) UpdateTaskCAS(ctx context.Context, task *common.AsyncTas
 	return nil
 }
 
+// MarkTaskSettled 以 CAS 方式把任务标记为已结算（WHERE billing_settled = false），同时落 actual_cost。
+// 返回是否由本次调用赢得标记：赢家负责补写用量日志，输家说明首次结算方或并发重试实例已标记并将补写
+// ——双方据此保证每请求至多一条用量日志。仅写最小字段集、不做整行覆盖，避免重放进程用陈旧对象
+// 刷掉其他并发变更（如软删除标记）
+func (p *AsyncProvider) MarkTaskSettled(ctx context.Context, task *common.AsyncTask) (bool, error) {
+	result, err := dao.TskModelTasks.Ctx(ctx).
+		Where("id", task.ID).
+		Where("billing_settled", false).
+		Update(map[string]any{
+			"billing_settled": true,
+			"actual_cost":     task.ActualCost,
+			"updated_at":      time.Now(),
+		})
+	if err != nil {
+		return false, gerror.Wrapf(err, "mark task settled failed: id=%d", task.ID)
+	}
+	rows, _ := result.RowsAffected()
+	return rows > 0, nil
+}
+
 // GetTaskByPublicID 根据公开任务 ID 查询（软删除的任务视为不存在）
 func (p *AsyncProvider) GetTaskByPublicID(ctx context.Context, publicTaskID string) (*common.AsyncTask, error) {
 	var row *entity.TskModelTasks

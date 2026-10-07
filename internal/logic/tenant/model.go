@@ -39,6 +39,9 @@ type tenantModelPriceRow struct {
 	CustomCacheReadPrice     *float64 `json:"custom_cache_read_price"`
 	CustomCacheCreationPrice *float64 `json:"custom_cache_creation_price"`
 	CustomPricingTiers       string   `json:"custom_pricing_tiers"`
+	CustomPricing            string   `json:"custom_pricing"` // 定价覆盖补丁（矩阵/时段/参数倍率）
+	CustomDiscountLabel      *string  `json:"discount_label"`
+	CustomPriceChangeNote    *string  `json:"price_change_note"`
 	BasePricing              string   `json:"base_pricing"` // pricing JSONB（唯一真相）
 }
 
@@ -86,7 +89,10 @@ type priceInfo struct {
 	CustomCacheReadPrice     *float64
 	CustomCacheCreationPrice *float64
 	CustomPricingTiers       string
-	BaseBlob                 *billing.PricingBlob // 平台 pricing JSONB 解析结果（tiered 阶梯/时段/per_second 矩阵）
+	CustomDiscountLabel      *string
+	CustomPriceChangeNote    *string
+	BaseBlob                 *billing.PricingBlob        // 平台 pricing JSONB 解析结果（tiered 阶梯/时段/per_second 矩阵）
+	Patch                    *billing.TenantPricingPatch // 租户覆盖补丁（矩阵/时段/参数倍率），nil=全继承
 }
 
 // BasePerSecondPrices per_second 矩阵（无 blob 时为 nil）
@@ -95,6 +101,25 @@ func (p *priceInfo) BasePerSecondPrices() map[string]float64 {
 		return nil
 	}
 	return p.BaseBlob.Prices
+}
+
+// EffectivePerSecondPrices 生效按秒矩阵：租户补丁覆盖优先（整体替换），未覆盖走平台矩阵。
+// 与计费读取侧 GetModelPriceAt 同口径（ApplyTenantPricingPatch）
+func (p *priceInfo) EffectivePerSecondPrices() map[string]float64 {
+	prices, _, _ := billing.ApplyTenantPricingPatch(p.Patch, p.BasePerSecondPrices(), nil, nil)
+	return prices
+}
+
+// EffectiveTimeSegments 生效时段定价：租户补丁覆盖优先（空=显式关闭平台时段），未覆盖走平台时段。
+// 返回 nil 表示无时段（含显式关闭）
+func (p *priceInfo) EffectiveTimeSegments() []billing.TimeSegment {
+	if p.Patch != nil && p.Patch.TimeSegments != nil {
+		return *p.Patch.TimeSegments
+	}
+	if p.BaseBlob == nil {
+		return nil
+	}
+	return p.BaseBlob.TimeSegments
 }
 
 // groupPriceInfo 分组模型的价格信息
@@ -163,7 +188,7 @@ func (s *sTenant) ListAvailableModels(ctx context.Context, req *v1.TenantAvailab
 			LeftJoin("mdl_pricing p ON p.model_id = mdl_tenant_models.model_id").
 			Where("mdl_tenant_models.tenant_id", tenantID).
 			WhereIn("mdl_tenant_models.model_id", explicitDBIDs).
-			Fields("mdl_tenant_models.model_id AS model_db_id, mdl_tenant_models.id, mdl_tenant_models.billing_mode, mdl_tenant_models.per_request_price, mdl_tenant_models.discount_ratio, mdl_tenant_models.max_concurrency, p.billing_mode AS base_billing_mode, p.pricing AS base_pricing, p.discount_label AS base_discount_label, p.price_change_note AS base_price_change_note, mdl_tenant_models.custom_input_price, mdl_tenant_models.custom_output_price, mdl_tenant_models.custom_cache_read_price, mdl_tenant_models.custom_cache_creation_price, mdl_tenant_models.custom_pricing_tiers").
+			Fields("mdl_tenant_models.model_id AS model_db_id, mdl_tenant_models.id, mdl_tenant_models.billing_mode, mdl_tenant_models.per_request_price, mdl_tenant_models.discount_ratio, mdl_tenant_models.max_concurrency, p.billing_mode AS base_billing_mode, p.pricing AS base_pricing, p.discount_label AS base_discount_label, p.price_change_note AS base_price_change_note, mdl_tenant_models.custom_input_price, mdl_tenant_models.custom_output_price, mdl_tenant_models.custom_cache_read_price, mdl_tenant_models.custom_cache_creation_price, mdl_tenant_models.custom_pricing_tiers, mdl_tenant_models.custom_pricing, mdl_tenant_models.discount_label AS custom_discount_label, mdl_tenant_models.price_change_note AS custom_price_change_note").
 			Scan(&priceResults)
 		if err != nil {
 			return nil, err
@@ -187,7 +212,10 @@ func (s *sTenant) ListAvailableModels(ctx context.Context, req *v1.TenantAvailab
 			CustomCacheReadPrice:     r.CustomCacheReadPrice,
 			CustomCacheCreationPrice: r.CustomCacheCreationPrice,
 			CustomPricingTiers:       r.CustomPricingTiers,
+			CustomDiscountLabel:      r.CustomDiscountLabel,
+			CustomPriceChangeNote:    r.CustomPriceChangeNote,
 			BaseBlob:                 billing.ParsePricingBlob(r.BasePricing),
+			Patch:                    billing.ParseTenantPricingPatch(r.CustomPricing),
 		}
 		pi.BaseInputPrice, pi.BaseOutputPrice, pi.BaseCacheReadPrice, pi.BaseCacheCreationPrice, pi.BasePerRequestPrice =
 			fillFromBlob(pi.BaseBlob)
@@ -252,6 +280,16 @@ func (s *sTenant) ListAvailableModels(ctx context.Context, req *v1.TenantAvailab
 				})
 			}
 		}
+		// 时段：显式分配模型租户覆盖优先（覆盖/继承/显式关闭三态，见 EffectiveTimeSegments），
+		// 分组来源模型纯平台时段
+		if m.Source == "explicit" {
+			if pi, ok := priceMap[m.ModelDBID]; ok {
+				if segs := pi.EffectiveTimeSegments(); len(segs) > 0 {
+					timeSegmentsMap[m.ModelDBID] = segs
+				}
+				continue
+			}
+		}
 		if len(blob.TimeSegments) > 0 {
 			timeSegmentsMap[m.ModelDBID] = blob.TimeSegments
 		}
@@ -296,17 +334,17 @@ func (s *sTenant) ListAvailableModels(ctx context.Context, req *v1.TenantAvailab
 				OutputPrice:        outputPrice,
 				CacheReadPrice:     cacheReadPrice,
 				CacheCreationPrice: cacheCreationPrice,
-				DiscountLabel:      pi.BaseDiscountLabel,
-				PriceChangeNote:    pi.BasePriceChangeNote,
+				DiscountLabel:      effectiveStrPtr(pi.CustomDiscountLabel, pi.BaseDiscountLabel),
+				PriceChangeNote:    effectiveStrPtr(pi.CustomPriceChangeNote, pi.BasePriceChangeNote),
 			}
 
 			if effectiveBillingMode == "tiered" {
 				item.PricingTiers = buildTiers(pi.CustomPricingTiers, pi.BaseInputPrice, pi.BaseOutputPrice, baseTiersMap[m.ModelDBID])
 			}
-			// 按秒/特殊计费：矩阵来自平台定价（租户不逐格覆盖，倍率在计费时作用）；
+			// 按秒/特殊计费：矩阵租户覆盖优先（整体替换），未覆盖走平台定价；
 			// special 的矩阵是输出生成组件的参考单价（素材组件单价在方案配置中）
 			if effectiveBillingMode == "per_second" || effectiveBillingMode == billing.BillingModeSpecial {
-				item.PerSecondPrices = pi.BasePerSecondPrices()
+				item.PerSecondPrices = pi.EffectivePerSecondPrices()
 			}
 
 			item.TimePrices = buildTimePrices(timeSegmentsMap[m.ModelDBID], effectiveBillingMode,
@@ -501,6 +539,14 @@ func effectivePrice(custom *float64, base float64) *float64 {
 		return &base
 	}
 	return nil
+}
+
+// effectiveStrPtr 展示字段租户覆盖优先（非空才生效），否则平台值
+func effectiveStrPtr(custom, base *string) *string {
+	if custom != nil && *custom != "" {
+		return custom
+	}
+	return base
 }
 
 // buildTiers 组装阶梯定价明细：自定义阶梯优先，否则用平台阶梯（pricing JSONB tiers 数组，含首档）。

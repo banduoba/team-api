@@ -35,7 +35,7 @@ type TenantLevelConfigCreateReq struct {
 	CumulativeRechargeThreshold float64 `json:"cumulative_recharge_threshold" v:"required|min:0#请输入累计充值阈值|阈值不能为负数"`
 	MaxMembers                  int     `json:"max_members" v:"min:0#最大成员数不能为负数"`
 	MaxConcurrency              int     `json:"max_concurrency" v:"min:0#最大并发数不能为负数"`
-	PriceMultiplier             float64 `json:"price_multiplier" d:"1.0000"`
+	PriceMultiplier             float64 `json:"price_multiplier" d:"1.0000" v:"min:0.0001|max:1#价格乘数需大于 0|价格乘数不能超过 1（仅支持折扣，如 0.9=九折）"`
 	SortOrder                   int     `json:"sort_order" d:"0"`
 }
 

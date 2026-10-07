@@ -44,7 +44,7 @@ func (s *sTenant) Dashboard(ctx context.Context, req *v1.TenantDashboardReq) (*v
 	err := dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("created_at >= ?", today+" 00:00:00").
-		Fields("COUNT(*) as requests, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(total_cost), 0) as total_cost").
+		Fields("COUNT(*) as requests, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost").
 		Scan(&todayRow)
 	if err != nil {
 		return nil, err
@@ -55,7 +55,7 @@ func (s *sTenant) Dashboard(ctx context.Context, req *v1.TenantDashboardReq) (*v
 	err = dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("created_at >= ?", monthStart+" 00:00:00").
-		Fields("COUNT(*) as requests, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(total_cost), 0) as total_cost").
+		Fields("COUNT(*) as requests, COALESCE(SUM(input_tokens), 0) as input_tokens, COALESCE(SUM(output_tokens), 0) as output_tokens, COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost").
 		Scan(&monthRow)
 	if err != nil {
 		return nil, err
@@ -120,11 +120,13 @@ func (s *sTenant) Dashboard(ctx context.Context, req *v1.TenantDashboardReq) (*v
 		FailedRequests  int64   `json:"failed_requests"`
 		RetriedRequests int64   `json:"retried_requests"`
 	}
+	// 费用列实扣优先（actual_cost，0/NULL 回退 total_cost），与上面「今日/本月统计」同口径——
+	// 同屏的环比基数与本月消费口径一致，折扣租户的百分比才有意义
 	err = g.DB().Ctx(ctx).Raw(`
 		SELECT
-			COALESCE(SUM(CASE WHEN created_at >= ? THEN total_cost END), 0) AS cur_cost,
-			COALESCE(SUM(CASE WHEN created_at >= ? AND created_at < ? THEN total_cost END), 0) AS prev_cost,
-			COALESCE(SUM(CASE WHEN created_at >= ? AND status <> 'success' THEN total_cost END), 0) AS wasted_cost,
+			COALESCE(SUM(CASE WHEN created_at >= ? THEN COALESCE(NULLIF(actual_cost, 0), total_cost) END), 0) AS cur_cost,
+			COALESCE(SUM(CASE WHEN created_at >= ? AND created_at < ? THEN COALESCE(NULLIF(actual_cost, 0), total_cost) END), 0) AS prev_cost,
+			COALESCE(SUM(CASE WHEN created_at >= ? AND status <> 'success' THEN COALESCE(NULLIF(actual_cost, 0), total_cost) END), 0) AS wasted_cost,
 			COUNT(*) FILTER (WHERE created_at >= ? AND status <> 'success') AS failed_requests,
 			COUNT(*) FILTER (WHERE created_at >= ? AND retry_index > 0) AS retried_requests
 		FROM bil_usage_logs
@@ -212,7 +214,7 @@ func (s *sTenant) TokenTrends(ctx context.Context, req *v1.TenantTokenTrendsReq)
 			COALESCE(SUM(input_tokens), 0) as input_tokens,
 			COALESCE(SUM(output_tokens), 0) as output_tokens,
 			COUNT(*) as requests,
-			COALESCE(SUM(total_cost), 0) as total_cost
+			COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost
 		FROM bil_usage_logs
 		WHERE tenant_id = ? AND created_at >= ?
 		GROUP BY DATE(created_at)
@@ -270,7 +272,7 @@ func (s *sTenant) ModelDistribution(ctx context.Context, req *v1.TenantModelDist
 			COUNT(*) as requests,
 			COALESCE(SUM(input_tokens), 0) as input_tokens,
 			COALESCE(SUM(output_tokens), 0) as output_tokens,
-			COALESCE(SUM(total_cost), 0) as total_cost
+			COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost
 		FROM bil_usage_logs
 		WHERE tenant_id = ? AND created_at >= ?
 		GROUP BY model_name
@@ -316,7 +318,7 @@ func (s *sTenant) BalancePrediction(ctx context.Context, req *v1.TenantBalancePr
 	err := dao.BilUsageLogs.Ctx(ctx).
 		Where("tenant_id", tenantID).
 		Where("created_at >= ?", sevenDaysAgo+" 00:00:00").
-		Fields("COALESCE(SUM(total_cost), 0) as total_cost").
+		Fields("COALESCE(SUM(COALESCE(NULLIF(actual_cost, 0), total_cost)), 0) as total_cost").
 		Scan(&stats)
 	if err != nil {
 		return nil, err
@@ -522,8 +524,8 @@ func (s *sTenant) GetMemberUsageRanking(ctx context.Context, req *v1.TenantMembe
 			COUNT(*) FILTER (WHERE ul.created_at >= ?) AS requests,
 			COALESCE(SUM(CASE WHEN ul.created_at >= ? THEN ul.input_tokens END), 0) AS input_tokens,
 			COALESCE(SUM(CASE WHEN ul.created_at >= ? THEN ul.output_tokens END), 0) AS output_tokens,
-			COALESCE(SUM(CASE WHEN ul.created_at >= ? THEN ul.total_cost END), 0) AS total_cost,
-			COALESCE(SUM(CASE WHEN ul.created_at < ? THEN ul.total_cost END), 0) AS prev_cost,
+			COALESCE(SUM(CASE WHEN ul.created_at >= ? THEN COALESCE(NULLIF(ul.actual_cost, 0), ul.total_cost) END), 0) AS total_cost,
+			COALESCE(SUM(CASE WHEN ul.created_at < ? THEN COALESCE(NULLIF(ul.actual_cost, 0), ul.total_cost) END), 0) AS prev_cost,
 			COALESCE(u.quota_limit, 0) AS quota_limit,
 			COALESCE(u.quota_used, 0) AS quota_used,
 			COALESCE(u.quota_type, 'none') AS quota_type
